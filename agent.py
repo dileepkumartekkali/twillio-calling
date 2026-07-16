@@ -14,7 +14,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.idle_frame_processor import IdleFrameProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.sarvam.llm import SarvamLLMService
+from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.sarvam.stt import SarvamSTTService
 from pipecat.services.sarvam.tts import SarvamTTSService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
@@ -112,11 +112,17 @@ async def bot(runner_args: RunnerArguments):
             pace=1.0,
         ),
     )
-    # sarvam-30b for latency; switch to sarvam-105b if reply quality falls short
-    # once you're past plain-LLM-only and into RAG.
-    llm = SarvamLLMService(
-        api_key=os.getenv("SARVAM_API_KEY"),
-        settings=SarvamLLMService.Settings(model="sarvam-30b"),
+    # Swapped from SarvamLLMService: sarvam-30b was taking ~18s per turn in
+    # production testing (see chat notes on the mid-call latency debug), which
+    # is unusable on a live call. Groq's LPU inference is an order of magnitude
+    # faster for the same class of model. STT/TTS stay on Sarvam — Groq doesn't
+    # do Indic speech; this only replaces the reasoning step.
+    # llama-3.3-70b-versatile is the default; verify it holds up on native-script
+    # Hindi/Telugu/Tamil replies per SYSTEM_PROMPT — if quality is worse than
+    # sarvam-30b was, that's the tradeoff for the speed.
+    llm = GroqLLMService(
+        api_key=os.getenv("GROQ_API_KEY"),
+        settings=GroqLLMService.Settings(model="llama-3.3-70b-versatile"),
     )
 
     context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}])
