@@ -188,5 +188,7 @@ async def bot(runner_args: RunnerArguments):
     runner = PipelineRunner(handle_sigint=False)
     try:
         await runner.run(task)
+    except Exception:
+        logger.exception("Pipeline crashed mid-call")
     finally:
         call_timer.cancel()
