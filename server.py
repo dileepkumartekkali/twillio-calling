@@ -1,6 +1,6 @@
 """FastAPI entrypoint for Render. Exposes:
   - GET  /health -> Render health check
-  - POST /voice  -> Twilio's "A call comes in" webhook; returns TwiML pointing at /ws
+  - /voice (GET+POST) -> Twilio's "A call comes in" webhook; returns TwiML pointing at /ws
   - WS   /ws     -> wss://<your-render-host>/ws, opened by Twilio per the TwiML above
 """
 import os
@@ -20,7 +20,7 @@ async def health():
     return {"status": "ok"}
 
 
-@app.post("/voice")
+@app.api_route("/voice", methods=["GET", "POST"])
 async def voice(request: Request):
     stream_url = f"wss://{request.url.hostname}/ws"
     twiml = (
