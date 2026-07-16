@@ -4,17 +4,22 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import EndFrame, LLMRunFrame, LLMTextFrame, TranscriptionFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.idle_frame_processor import IdleFrameProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.groq.llm import GroqLLMService
+from pipecat.services.sarvam.llm import SarvamLLMService
 from pipecat.services.sarvam.stt import SarvamSTTService
 from pipecat.services.sarvam.tts import SarvamTTSService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
@@ -107,26 +112,44 @@ async def bot(runner_args: RunnerArguments):
         api_key=os.getenv("SARVAM_API_KEY"),
         settings=SarvamTTSService.Settings(
             model="bulbul:v3",
-            voice="anand",
+            # "shubh" is Sarvam's own documented default speaker for bulbul:v3 —
+            # no published naturalness ranking exists, but shipping it as the
+            # default is the closest signal to "most tuned" available. A/B test
+            # against "anand" (the previous voice, also valid) if this doesn't
+            # sound right on real calls.
+            voice="shubh",
             language=DEFAULT_LANGUAGE,  # overwritten per-turn by LanguageRouterProcessor
             pace=1.0,
         ),
     )
-    # Swapped from SarvamLLMService: sarvam-30b was taking ~18s per turn in
-    # production testing (see chat notes on the mid-call latency debug), which
-    # is unusable on a live call. Groq's LPU inference is an order of magnitude
-    # faster for the same class of model. STT/TTS stay on Sarvam — Groq doesn't
-    # do Indic speech; this only replaces the reasoning step.
-    # llama-3.3-70b-versatile is the default; verify it holds up on native-script
-    # Hindi/Telugu/Tamil replies per SYSTEM_PROMPT — if quality is worse than
-    # sarvam-30b was, that's the tradeoff for the speed.
-    llm = GroqLLMService(
-        api_key=os.getenv("GROQ_API_KEY"),
-        settings=GroqLLMService.Settings(model="llama-3.3-70b-versatile"),
+    # Reverted from GroqLLMService: no evidence Llama models reliably write
+    # native Indic script (Devanagari/Telugu/etc.) the way SYSTEM_PROMPT
+    # requires — general models tend to transliterate to Latin script, which
+    # silently breaks LanguageRouterProcessor's script-based TTS-language
+    # detection and made every reply come out in English regardless of what
+    # the caller spoke. Sarvam's own LLM is trained for this specifically.
+    # The ~18s latency that motivated the Groq swap was measured *before* the
+    # VAD fix below — duplicate stacked LLM calls per turn (see chat notes on
+    # the mid-call latency debug) were likely inflating that number by
+    # contending on the same API key; re-measure latency now that only one
+    # clean call fires per turn before reaching for a faster LLM again.
+    llm = SarvamLLMService(
+        api_key=os.getenv("SARVAM_API_KEY"),
+        settings=SarvamLLMService.Settings(model="sarvam-30b"),
     )
 
     context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}])
-    context_aggregator = LLMContextAggregatorPair(context)
+    # Without a VAD analyzer, TurnAnalyzerUserTurnStopStrategy never sees a real
+    # VADUserStoppedSpeakingFrame and falls back to firing "turn stopped" on a
+    # blind ~1s timeout after EVERY transcript — so one utterance can trigger
+    # multiple stacked LLM calls with growing context, which is what caused the
+    # repeated/overlapping replies when a caller tried to interrupt. Silero VAD
+    # restores real silence-based turn detection (and lets Sarvam STT's own
+    # VAD-gated flush() fire at the right time too).
+    context_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2))),
+    )
     lang_router = LanguageRouterProcessor(tts)
 
     idle_retries = 0
