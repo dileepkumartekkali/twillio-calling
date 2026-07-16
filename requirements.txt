@@ -1,0 +1,6 @@
+pipecat-ai[websocket,sarvam]
+sarvamai>=0.1.25
+python-dotenv
+loguru
+fastapi
+uvicorn

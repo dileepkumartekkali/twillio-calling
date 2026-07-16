@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: voice-agent-twilio
+    runtime: python
+    plan: free # pilot/low-volume only — single instance, no autoscaling, spins down when idle.
+    # Upgrade to `standard` once real call volume matters: free tier has no SLA and
+    # can't autoscale past one instance, see chat notes on the 10-50 concurrent target.
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /health
+    envVars:
+      - key: SARVAM_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
