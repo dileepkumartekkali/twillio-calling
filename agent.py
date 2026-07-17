@@ -327,6 +327,9 @@ class CallSession:
         try:
             t0 = time.monotonic()
             ulaw = await synthesize_ulaw(text, language)
+            if not ulaw:
+                logger.warning(f"TTS returned EMPTY audio for: {text[:60]!r} ({language})")
+                return
             logger.info(
                 f"TTS synth {time.monotonic() - t0:.2f}s: {len(text)} chars ({language}) "
                 f"-> {len(ulaw) / SAMPLE_RATE:.1f}s audio"
@@ -374,6 +377,10 @@ class CallSession:
         )
         self._stt_socket = await self._stt_ctx.__aenter__()
         self._stt_socket.on(EventType.MESSAGE, self._on_stt_message_sync)
+        # STT socket dying silently was a real failure mode on the old build —
+        # surface error/close explicitly so the log names it.
+        self._stt_socket.on(EventType.ERROR, lambda e: logger.error(f"STT SOCKET ERROR: {e}"))
+        self._stt_socket.on(EventType.CLOSE, lambda e: logger.warning(f"STT SOCKET CLOSED: {e}"))
         self._bg_tasks.append(asyncio.create_task(self._stt_listener()))
         logger.info("Sarvam STT connected (server-side VAD)")
 
@@ -611,14 +618,30 @@ class CallSession:
             self._bg_tasks.append(asyncio.create_task(self._idle_watchdog()))
             self._bg_tasks.append(asyncio.create_task(self._call_length_limit()))
 
+            media_frames = 0
+            first_media = True
+            rate_window_start = time.monotonic()
             while True:
                 raw = await self.ws.receive_text()
                 msg = json.loads(raw)
                 event = msg.get("event")
                 if event == "media":
+                    if first_media:
+                        logger.info("First caller audio frame received")
+                        first_media = False
+                    media_frames += 1
+                    # Inbound audio health: Twilio sends ~50 frames/s; a low
+                    # rate here means the caller's audio isn't reaching us
+                    # steadily (network / Twilio side), which STT hears as
+                    # gaps — a mishearing/clarity culprit outside our code.
+                    if time.monotonic() - rate_window_start >= 15:
+                        logger.info(f"INBOUND AUDIO: {media_frames} frames in last 15s (~750 expected)")
+                        media_frames = 0
+                        rate_window_start = time.monotonic()
                     await self.feed_audio(msg["media"]["payload"])
                 elif event == "mark":
                     self.marks_pending = max(0, self.marks_pending - 1)
+                    logger.debug(f"PLAYBACK DONE ({msg.get('mark', {}).get('name')}, pending={self.marks_pending})")
                     # Bot audio just finished PLAYING: the silence clock starts
                     # now, not at the caller's previous utterance — otherwise a
                     # long bot reply eats the whole idle window and the nudge/
