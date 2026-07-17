@@ -6,7 +6,15 @@ from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import EndFrame, LLMRunFrame, LLMTextFrame, TranscriptionFrame, TTSSpeakFrame
+from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    EndFrame,
+    LLMRunFrame,
+    LLMTextFrame,
+    TranscriptionFrame,
+    TTSSpeakFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -198,10 +206,18 @@ async def bot(runner_args: RunnerArguments):
             )
             await processor.push_frame(EndFrame())
 
-    # types=[TranscriptionFrame]: only the caller actually speaking resets the idle
-    # timer. Left at default (monitors all frames) this would never fire, since
-    # audio/control frames flow through the pipeline constantly regardless of silence.
-    idle_guard = IdleFrameProcessor(callback=on_idle, timeout=IDLE_NUDGE_SECONDS, types=[TranscriptionFrame])
+    # Also watch Bot{Started,Stopped}SpeakingFrame (pushed upstream by the output
+    # transport, so they do reach this position) — without them, the idle timer
+    # only resets on caller speech, so a 5s timeout fires WHILE the bot is still
+    # generating/speaking its own reply (no new caller transcript arrives during
+    # that gap), misreading normal turn latency as caller silence and cutting
+    # the call mid-conversation. Now it resets on either side's activity, so it
+    # only fires on genuine dead air from both parties.
+    idle_guard = IdleFrameProcessor(
+        callback=on_idle,
+        timeout=IDLE_NUDGE_SECONDS,
+        types=[TranscriptionFrame, BotStartedSpeakingFrame, BotStoppedSpeakingFrame],
+    )
 
     pipeline = Pipeline(
         [
