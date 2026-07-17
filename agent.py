@@ -212,10 +212,13 @@ own transcript appears to you — never Romanized/Latin transliteration (no
 "kaise ho", write "कैसे हो"). Keep replies short and conversational: this is a
 phone call, not a chat window, so avoid lists, markdown, or long paragraphs.
 
-If the caller asks to end the call — in ANY language or mix ("end the call",
-"call cut chey", "कॉल काट दो", "band karo", "hang up", "bye, cut it", etc.) —
-call the end_call function immediately. Do not reply with text instead of
-calling it; the goodbye is spoken automatically."""
+Call the end_call function ONLY when the caller CLEARLY and EXPLICITLY asks
+to end the call — in any language or mix ("end the call", "call cut chey",
+"कॉल काट दो", "band karo", "hang up now"). Do NOT call it for casual
+acknowledgments, a passing "okay"/"bye" mid-conversation, unclear or
+garbled speech, or anything you are not sure about — when in doubt, keep
+talking and ask instead of hanging up. Never call it on your own
+initiative. When you do call it, the goodbye is spoken automatically."""
 
 
 class AudioGapMonitor(FrameProcessor):
@@ -350,8 +353,10 @@ async def bot(runner_args: RunnerArguments):
     end_call_tool = FunctionSchema(
         name="end_call",
         description=(
-            "End the phone call. Call this immediately when the caller asks to "
-            "end, cut, stop, or hang up the call, in any language or language mix."
+            "End the phone call. Use ONLY when the caller clearly and explicitly "
+            "asks to end/cut/stop/hang up the call (any language or mix). Never "
+            "use for casual acknowledgments, a passing okay/bye, or unclear "
+            "speech — if unsure, do not call this."
         ),
         properties={},
         required=[],
@@ -369,20 +374,18 @@ async def bot(runner_args: RunnerArguments):
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            # min_volume lowered from the 0.6 default: pipecat's VAD gate is
-            # "confidence >= 0.7 AND volume >= min_volume", where volume is
-            # EBU-R128 loudness normalized to [0,1] — compressed 8kHz mu-law
-            # phone audio frequently sits below 0.6, so at the default the VAD
-            # never fires on quiet callers. When VAD doesn't fire, Sarvam STT's
-            # end-of-speech flush() never runs (it's gated on
-            # VADUserStoppedSpeakingFrame) and Sarvam's server segments
-            # utterances on its own timetable — measured at up to 14.2s in a
-            # real call. Silero's neural confidence (0.7, unchanged) remains
-            # the actual voice detector; the volume floor is just a noise
-            # pre-filter, and 0.4 keeps some floor without gating out phone
-            # speech. ponytail: if VAD still never logs on real calls, drop
-            # this further or to 0 and rely on confidence alone.
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2, min_volume=0.4)),
+            # min_volume=0: rely on Silero's neural confidence (0.7, unchanged)
+            # alone as the voice detector. The volume floor is an EBU-R128
+            # loudness gate ANDed with confidence — compressed 8kHz mu-law
+            # phone audio is quiet, and even at the previously-lowered 0.4 a
+            # soft-spoken caller can ride under it, so the VAD misses their
+            # speech entirely. When VAD misses speech: Sarvam STT's
+            # end-of-speech flush() never runs (14.2s transcript spikes
+            # measured), AND nothing resets the idle timer while the caller
+            # is mid-sentence — so the call can be "ended" while they're
+            # still talking. Silero's confidence gate keeps line noise out;
+            # the redundant volume floor costs more than it protects here.
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2, min_volume=0)),
             # Default start strategy (VADUserTurnStartStrategy) triggers a barge-in
             # on ANY audio energy, including noise or the bot's own voice leaking
             # back on the line (no echo cancellation on this call) — confirmed in
