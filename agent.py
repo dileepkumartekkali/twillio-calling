@@ -54,7 +54,11 @@ SAMPLE_RATE = 8000  # Twilio Media Streams: 8kHz mu-law, both directions
 MAX_CALL_SECONDS = 55 * 60
 IDLE_NUDGE_SECONDS = 5      # silence before "are you there?"
 IDLE_HANGUP_SECONDS = 10    # silence before goodbye + hangup
-TURN_SETTLE_SECONDS = 0.7   # quiet time after last transcript before the LLM turn fires
+# Quiet time after the last transcript before the LLM turn fires. Measured
+# transcript lag after END_SPEECH is 0.1-0.7s; 0.45 balances snappy replies
+# against splitting one utterance into two turns when transcripts arrive in
+# parts. Raise this first if turns start double-firing.
+TURN_SETTLE_SECONDS = 0.45
 MAX_CONCURRENT_CALLS = 3    # ponytail: free tier is one tiny instance; shed load beyond this
 
 GREETING_TEXT = "Hello! How can I help you today?"
@@ -103,8 +107,11 @@ mixed languages, mix your reply the same way — don't switch to pure English or
 pure Hindi unless they did. Write Indian-language words in their NATIVE SCRIPT
 (Devanagari for Hindi, Telugu script for Telugu, etc.) exactly as the caller's
 own transcript appears to you — never Romanized/Latin transliteration (no
-"kaise ho", write "कैसे हो"). Keep replies short and conversational: this is a
-phone call, not a chat window, so avoid lists, markdown, or long paragraphs.
+"kaise ho", write "कैसे हो"). This is a live phone call, not a chat window:
+reply in AT MOST 1-2 short sentences (under about 15 words each), like a
+human speaking naturally. Never use lists, markdown, or long paragraphs.
+If there is a lot to say, give the most important part and ask if they
+want more.
 
 Call the end_call function ONLY when the caller CLEARLY and EXPLICITLY asks
 to end the call — in any language or mix ("end the call", "call cut chey",
@@ -130,6 +137,37 @@ END_CALL_TOOL = {
 
 # Sentence boundaries incl. Devanagari danda and common Indic terminators.
 _SENTENCE_END = re.compile(r"(?<=[.!?।؟…])\s+")
+_CLAUSE_END = re.compile(r"[,;:]\s")
+# Measured on a real call: Sarvam TTS REST took ~5s for a 135-char sentence
+# vs ~1.3s for short ones — synthesis time scales with length, so long
+# sentences must be chunked at clause boundaries to keep first-audio fast.
+MAX_TTS_CHUNK_CHARS = 60
+
+
+def _split_speech_chunks(text: str) -> tuple[list[str], str]:
+    """Split streamed LLM text into TTS-ready chunks. Returns (chunks, rest):
+    complete sentences always split; an overlong sentence-in-progress is cut
+    at a clause boundary (comma/semicolon) so TTS never waits on a 5s synth."""
+    chunks = []
+    rest = text
+    while True:
+        m = _SENTENCE_END.search(rest)
+        if m:
+            piece = rest[: m.start()].strip()
+            if piece:
+                chunks.append(piece)
+            rest = rest[m.end():]
+            continue
+        if len(rest) > MAX_TTS_CHUNK_CHARS:
+            cut = None
+            for cm in _CLAUSE_END.finditer(rest[: MAX_TTS_CHUNK_CHARS + 20]):
+                cut = cm.end()
+            if cut and cut > 20:
+                chunks.append(rest[:cut].strip())
+                rest = rest[cut:]
+                continue
+        break
+    return chunks, rest
 
 # Module-level shared clients: connection pools persist ACROSS calls, so no
 # call after the first pays TLS/DNS setup to Groq or Sarvam's REST API (the
@@ -298,11 +336,17 @@ class CallSession:
                 }))
                 continue
             now = time.monotonic()
-            if next_time and now - next_time > 0.5:
-                logger.warning(f"OUTBOUND AUDIO STALL: sender {now - next_time:.2f}s behind schedule")
+            # A schedule far in the past just means the stream was idle
+            # between utterances — restart it silently (the old warning here
+            # fired a misleading "STALL" at every utterance start).
             next_time = max(next_time, now - LEAD)
             if next_time > now:
-                await asyncio.sleep(next_time - now)
+                target = next_time
+                await asyncio.sleep(target - now)
+                late = time.monotonic() - target
+                if late > 0.5:
+                    # We overslept a scheduled send: genuine event-loop/CPU stall.
+                    logger.warning(f"OUTBOUND AUDIO STALL: send {late:.2f}s late (CPU starvation)")
             await self.ws.send_text(json.dumps({
                 "event": "media",
                 "streamSid": self.stream_sid,
@@ -510,15 +554,13 @@ class CallSession:
                         first_token = False
                     reply_so_far += delta.content
                     buffer += delta.content
-                    # Speak each completed sentence while the rest streams.
-                    parts = _SENTENCE_END.split(buffer)
-                    buffer = parts[-1]  # incomplete tail stays buffered
-                    for sentence in parts[:-1]:
-                        if sentence.strip():
-                            await self._speak_reply_sentence(sentence.strip(), reply_so_far)
-                            if first_audio:
-                                logger.info(f"FIRST REPLY AUDIO QUEUED (+{time.monotonic() - t0:.2f}s from turn fire)")
-                                first_audio = False
+                    # Speak each completed sentence/clause while the rest streams.
+                    chunks, buffer = _split_speech_chunks(buffer)
+                    for piece in chunks:
+                        await self._speak_reply_sentence(piece, reply_so_far)
+                        if first_audio:
+                            logger.info(f"FIRST REPLY AUDIO QUEUED (+{time.monotonic() - t0:.2f}s from turn fire)")
+                            first_audio = False
             if buffer.strip():
                 await self._speak_reply_sentence(buffer.strip(), reply_so_far)
                 buffer = ""

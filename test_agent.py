@@ -366,7 +366,27 @@ async def test_outbound_pacing():
     print(f"PASS outbound pacing: 1s of audio took {elapsed:.2f}s to send (lead cushion 0.4s)")
 
 
+def test_speech_chunking():
+    """Long single-sentence replies must be cut at clause boundaries so TTS
+    never synthesizes a 5s block before the caller hears anything."""
+    from agent import _split_speech_chunks
+    # Complete sentences split as before
+    chunks, rest = _split_speech_chunks("Hi there! How can I help? And more")
+    assert chunks == ["Hi there!", "How can I help?"] and rest == "And more", (chunks, rest)
+    # A long sentence-in-progress splits at a clause boundary
+    long_clause = "అవును సార్, ఈరోజు చెన్నై నుండి హైదరాబాద్ వరకు చాలా ఫ్లైట్లు ఉన్నాయి, ఉదాహరణకు ఇండిగో"
+    chunks, rest = _split_speech_chunks(long_clause)
+    assert chunks, "overlong clause text must yield an early chunk"
+    assert all(c.strip() for c in chunks)
+    assert rest and "ఇండిగో" in rest, rest
+    # Short incomplete text stays buffered untouched
+    chunks, rest = _split_speech_chunks("చిన్న వాక్యం")
+    assert chunks == [] and rest == "చిన్న వాక్యం"
+    print("PASS speech chunking: sentences split, long clauses cut early, short text buffered")
+
+
 async def main():
+    test_speech_chunking()
     test_wav_to_ulaw()
     await test_handshake_and_media_flow()
     await test_normal_turn_and_reply()
