@@ -32,8 +32,38 @@ load_dotenv(override=True)
 # plan cap) — TimeLimit is account/config-specific. Keep the same wrap-up window
 # as a UX choice: nobody wants a 55-minute phone-bot call anyway.
 MAX_CALL_SECONDS = 55 * 60
-# Silence handling: nudge once, then hang up rather than hold a dead line open.
-IDLE_NUDGE_SECONDS = 15
+# Silence handling: nudge once at 5s, hang up at 10s rather than hold a dead line open.
+IDLE_NUDGE_SECONDS = 5
+
+# Native-script text for the two idle-timeout messages, keyed by the same Sarvam
+# language codes lang_router.py produces, so the nudge/goodbye speaks in whatever
+# language the call was last using (falls back to English if somehow unset).
+# NOTE: these are machine-drafted translations, not reviewed by a native speaker
+# per language — spot-check with someone fluent before fully trusting on live calls.
+STILL_THERE_MESSAGES = {
+    "en-IN": "Are you there?",
+    "hi-IN": "क्या आप वहाँ हैं?",
+    "bn-IN": "আপনি কি সেখানে আছেন?",
+    "pa-IN": "ਕੀ ਤੁਸੀਂ ਉੱਥੇ ਹੋ?",
+    "gu-IN": "શું તમે ત્યાં છો?",
+    "or-IN": "ଆପଣ କଣ ସେଠାରେ ଅଛନ୍ତି?",
+    "ta-IN": "நீங்கள் அங்கே இருக்கிறீர்களா?",
+    "te-IN": "మీరు అక్కడ ఉన్నారా?",
+    "kn-IN": "ನೀವು ಅಲ್ಲಿ ಇದ್ದೀರಾ?",
+    "ml-IN": "നിങ്ങൾ അവിടെ ഉണ്ടോ?",
+}
+GOODBYE_MESSAGES = {
+    "en-IN": "I'll end the call here. Goodbye!",
+    "hi-IN": "मैं यहाँ कॉल समाप्त कर रहा हूँ। अलविदा!",
+    "bn-IN": "আমি এখানে কল শেষ করছি। বিদায়!",
+    "pa-IN": "ਮੈਂ ਇੱਥੇ ਕਾਲ ਖਤਮ ਕਰ ਰਿਹਾ ਹਾਂ। ਅਲਵਿਦਾ!",
+    "gu-IN": "હું અહીં કૉલ સમાપ્ત કરી રહ્યો છું. આવજો!",
+    "or-IN": "ମୁଁ ଏଠାରେ କଲ୍ ସମାପ୍ତ କରୁଛି। ବିଦାୟ!",
+    "ta-IN": "நான் இங்கே அழைப்பை முடிக்கிறேன். போய் வருகிறேன்!",
+    "te-IN": "నేను ఇక్కడ కాల్ ముగిస్తున్నాను. వీడ్కోలు!",
+    "kn-IN": "ನಾನು ಇಲ್ಲಿ ಕರೆಯನ್ನು ಮುಗಿಸುತ್ತಿದ್ದೇನೆ. ವಿದಾಯ!",
+    "ml-IN": "ഞാൻ ഇവിടെ കോൾ അവസാനിപ്പിക്കുന്നു. വിട!",
+}
 
 
 class LanguageRouterProcessor(FrameProcessor):
@@ -154,10 +184,18 @@ async def bot(runner_args: RunnerArguments):
     async def on_idle(processor):
         nonlocal idle_retries
         idle_retries += 1
-        if idle_retries <= 2:
-            await processor.push_frame(TTSSpeakFrame("Hello? Are you still there?"))
+        # tts._settings.language is kept current by LanguageRouterProcessor from
+        # the last real turn, so these messages land in whatever language the
+        # call was actually using — not hardcoded English regardless of caller.
+        current_lang = tts._settings.language
+        if idle_retries == 1:
+            await processor.push_frame(
+                TTSSpeakFrame(STILL_THERE_MESSAGES.get(current_lang, STILL_THERE_MESSAGES[DEFAULT_LANGUAGE]))
+            )
         else:
-            await processor.push_frame(TTSSpeakFrame("I'll end the call here. Goodbye!"))
+            await processor.push_frame(
+                TTSSpeakFrame(GOODBYE_MESSAGES.get(current_lang, GOODBYE_MESSAGES[DEFAULT_LANGUAGE]))
+            )
             await processor.push_frame(EndFrame())
 
     # types=[TranscriptionFrame]: only the caller actually speaking resets the idle
