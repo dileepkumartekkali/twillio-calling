@@ -320,6 +320,7 @@ async def bot(runner_args: RunnerArguments):
     audio_gap_monitor = AudioGapMonitor()
 
     idle_retries = 0
+    call_ending = False
 
     def reset_idle_retries():
         nonlocal idle_retries
@@ -328,7 +329,15 @@ async def bot(runner_args: RunnerArguments):
         idle_retries = 0
 
     async def on_idle(processor):
-        nonlocal idle_retries
+        nonlocal idle_retries, call_ending
+        # IdleFrameProcessor's own loop keeps firing on_idle every timeout
+        # indefinitely — it has no concept of "we already decided to end this
+        # call." Confirmed in a real call log: goodbye + EndFrame got queued
+        # TWICE more (retry #2, then retry #3) after the first "ending call",
+        # because the call hadn't actually torn down yet when the next timeout
+        # fired. This guard makes the ending decision fire exactly once.
+        if call_ending:
+            return
         idle_retries += 1
         logger.info(f"IDLE FIRED: retry #{idle_retries} (timeout={IDLE_NUDGE_SECONDS}s)")
         # tts._settings.language is kept current by LanguageRouterProcessor from
@@ -340,6 +349,7 @@ async def bot(runner_args: RunnerArguments):
                 TTSSpeakFrame(STILL_THERE_MESSAGES.get(current_lang, STILL_THERE_MESSAGES[DEFAULT_LANGUAGE]))
             )
         else:
+            call_ending = True
             logger.info("IDLE: ending call")
             await processor.push_frame(
                 TTSSpeakFrame(GOODBYE_MESSAGES.get(current_lang, GOODBYE_MESSAGES[DEFAULT_LANGUAGE]))
