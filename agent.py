@@ -19,7 +19,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.idle_frame_processor import IdleFrameProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.google.llm import GoogleLLMService
+from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.sarvam.stt import SarvamSTTService
 from pipecat.services.sarvam.tts import SarvamTTSService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
@@ -123,19 +123,16 @@ async def bot(runner_args: RunnerArguments):
         ),
     )
     # Confirmed post-VAD-fix: Sarvam's own LLM is still too slow for a live call
-    # (user-verified, not just the earlier stacked-call artifact). Groq/Llama
-    # was fast but had no evidence of reliable native-script Indic output.
-    # Gemini 2.5 Flash-Lite is the balance: fastest measured time-to-first-token
-    # of any option checked (artificialanalysis.ai), and Google has published
-    # both a dedicated Indic-generation benchmark (IndicGenBench) and product
-    # claims of native-script output across 9 Indian languages — the strongest
-    # evidence available for any non-Sarvam model. Still verify Telugu/Tamil
-    # script fidelity on real calls before fully trusting it; per published
-    # script-comprehension studies those two degrade more than Hindi across
-    # every model tested, Gemini included.
-    llm = GoogleLLMService(
-        api_key=os.getenv("GOOGLE_API_KEY"),
-        settings=GoogleLLMService.Settings(model="gemini-2.5-flash-lite"),
+    # (user-verified, not just the earlier stacked-call artifact). Gemini
+    # 2.5 Flash-Lite was tried next but its free tier's request-per-minute cap
+    # is too tight for a live phone line. Settled on Groq's LPU inference for
+    # speed. Known risk, unresolved: no confirmed evidence Llama reliably
+    # writes native Devanagari/Telugu/Tamil script instead of Romanized
+    # transliteration — watch real calls for this; if TTS keeps landing on
+    # en-IN regardless of what the caller spoke, that's the symptom.
+    llm = GroqLLMService(
+        api_key=os.getenv("GROQ_API_KEY"),
+        settings=GroqLLMService.Settings(model="llama-3.3-70b-versatile"),
     )
 
     context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}])
