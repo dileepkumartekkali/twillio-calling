@@ -439,6 +439,30 @@ async def test_streaming_tts_path():
     print("PASS streaming TTS: pieces sent, flushed, audio paced, barge-in closes stream")
 
 
+async def test_barge_in_during_synthesis_tail():
+    """The reported bug: LLM finishes fast (gen_task done) while Sarvam is
+    still synthesizing, and between audio events marks drain to 0 — the old
+    gate went blind there, so the caller's interruption was treated as a new
+    turn while the rest of the reply kept playing over them."""
+    ws, s = make_session([fake_stream([])])
+    fake_tts = FakeTtsStream()
+    s._tts_stream = fake_tts
+    await start_session(s)
+    # Simulate the gap: generation finished, no marks pending, but server
+    # synthesis still in flight (final event not received).
+    s._tts_synthesizing = True
+    assert s.output_in_flight, "synthesis tail must count as output in flight"
+    await s._on_stt_message(stt_data("wait please stop talking"))
+    await asyncio.sleep(0.05)
+    assert ws.events("clear"), "interruption during synthesis tail must clear audio"
+    assert fake_tts.closed, "interruption must close the TTS stream"
+    assert not s._tts_synthesizing, "synthesis flag must clear on barge-in"
+    # And the interruption becomes the next turn:
+    assert s.transcript_buffer, "the interrupting speech must be queued as the next turn"
+    await stop_session(s)
+    print("PASS barge-in during synthesis tail: gate no longer goes blind between audio events")
+
+
 async def main():
     test_speech_chunking()
     test_wav_to_ulaw()
@@ -453,6 +477,7 @@ async def main():
     await test_echo_guard()
     await test_outbound_pacing()
     await test_streaming_tts_path()
+    await test_barge_in_during_synthesis_tail()
     await test_end_call_tool()
     await test_language_flow()
     print("\nall agent self-checks passed")

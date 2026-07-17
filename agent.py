@@ -285,6 +285,10 @@ class TtsStream:
                     pcm = base64.b64decode(msg["data"]["audio"])
                     await self.session.enqueue_stream_audio(audioop.lin2ulaw(pcm, 2))
                 elif mtype == "event" and msg.get("data", {}).get("event_type") == "final":
+                    # Server finished synthesizing everything we flushed — the
+                    # reply's audio is now fully in our queue/marks, so the
+                    # "output in flight" gate can hand over to marks tracking.
+                    self.session._tts_synthesizing = False
                     logger.debug("TTS stream: synthesis final")
                 elif mtype == "error":
                     logger.error(f"TTS STREAM ERROR: {msg.get('data', {}).get('message')}")
@@ -378,6 +382,7 @@ class CallSession:
         self._sender_started = False
         self._tts_stream: TtsStream | None = None
         self._reply_t0 = 0.0  # for FIRST REPLY AUDIO timing on the stream path
+        self._tts_synthesizing = False  # server still producing a reply's audio
 
         self._stt_ctx = None
         self._stt_socket = None
@@ -430,6 +435,7 @@ class CallSession:
     async def _drop_tts_stream(self):
         """Barge-in: discard in-flight synthesis by closing the stream (there
         is no cancel message in the protocol). Next reply reconnects lazily."""
+        self._tts_synthesizing = False
         if self._tts_stream:
             await self._tts_stream.close()
             self._tts_stream = None
@@ -508,12 +514,32 @@ class CallSession:
         words = re.findall(r"\w+", transcript.lower())
         if not words:
             return False
+        # A long utterance is almost never a pure echo — treating it as one
+        # would swallow a real interruption that happens to reuse the bot's
+        # topic words. Only short fragments qualify as echo.
+        if len(words) > 8:
+            return False
         overlap = sum(w in recent for w in words) / len(words)
         return overlap >= 0.7
 
     @property
     def bot_speaking(self) -> bool:
         return self.marks_pending > 0
+
+    @property
+    def output_in_flight(self) -> bool:
+        """True while ANY part of a reply is still pending: LLM generating,
+        Sarvam synthesizing (final event not yet seen), audio queued locally,
+        or audio playing at Twilio (marks). The old gate used only marks +
+        gen_task and went BLIND in the gaps between streamed audio events —
+        which let a caller's interruption be treated as a new turn while the
+        rest of the reply kept arriving and playing over them."""
+        return (
+            self.marks_pending > 0
+            or self._tts_synthesizing
+            or not self._out_q.empty()
+            or (self.gen_task is not None and not self.gen_task.done())
+        )
 
     # ---------------- STT ----------------
 
@@ -589,7 +615,7 @@ class CallSession:
 
                 # Barge-in: transcript-gated, >=2 real words while bot output
                 # is in flight (raw VAD blips used to falsely cancel replies).
-                if self.bot_speaking or (self.gen_task and not self.gen_task.done()):
+                if self.output_in_flight:
                     if self._looks_like_bot_echo(transcript):
                         logger.info(f"Ignoring echo of bot's own speech: {transcript[:50]!r}")
                         return
@@ -705,11 +731,13 @@ class CallSession:
         try:
             tts = await self._get_tts_stream(lang)
             await tts.send_text(sentence + " ")
+            self._tts_synthesizing = True  # cleared by the stream's `final` event
         except Exception:
             # Streaming path down: degrade to per-piece REST synthesis (the
             # previous behavior) rather than going silent.
             logger.exception("TTS stream failed; falling back to REST for this piece")
             self._tts_stream = None
+            self._tts_synthesizing = False
             await self.speak(sentence, lang)
             if self._reply_t0:
                 logger.info(f"FIRST REPLY AUDIO QUEUED (+{time.monotonic() - self._reply_t0:.2f}s from turn fire, rest)")
@@ -726,12 +754,7 @@ class CallSession:
             await asyncio.sleep(0.5)
             if self.call_ending:
                 continue
-            busy = (
-                self.user_speaking
-                or self.transcript_buffer
-                or (self.gen_task and not self.gen_task.done())
-                or self.bot_speaking
-            )
+            busy = self.user_speaking or bool(self.transcript_buffer) or self.output_in_flight
             if busy:
                 continue
             idle = time.monotonic() - self.last_activity
@@ -762,7 +785,7 @@ class CallSession:
         # Give Twilio time to play the goodbye out before killing the call
         # (paced delivery means a ~3s goodbye takes ~3s to drain).
         for _ in range(80):  # up to 8s
-            if not self.bot_speaking:
+            if not self.bot_speaking and self._out_q.empty():
                 break
             await asyncio.sleep(0.1)
         await asyncio.sleep(0.3)
