@@ -1,18 +1,28 @@
 """FastAPI entrypoint for Render. Exposes:
   - GET  /health -> Render health check
   - /voice (GET+POST) -> Twilio's "A call comes in" webhook; returns TwiML pointing at /ws
-  - WS   /ws     -> wss://<your-render-host>/ws, opened by Twilio per the TwiML above
+  - WS   /ws     -> wss://<host>/ws, opened by Twilio per the TwiML above
+
+Startup pre-warms the greeting audio and the Groq connection so the very
+first call is as fast as every later one.
 """
 import os
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response
 
-from agent import bot
-from pipecat.runner.types import WebSocketRunnerArguments
+from agent import handle_twilio_ws, warm_up
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await warm_up()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/health")
@@ -35,7 +45,7 @@ async def voice(request: Request):
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    await bot(WebSocketRunnerArguments(websocket=websocket))
+    await handle_twilio_ws(websocket)
 
 
 if __name__ == "__main__":

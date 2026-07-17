@@ -1,6 +1,13 @@
-pipecat-ai[websocket,sarvam]
-sarvamai>=0.1.25
-python-dotenv
-loguru
+# No pipecat, no onnxruntime, no local models: Sarvam's server-side VAD does
+# all speech detection. Small deps = fast boot + no CPU-throttle debt on
+# Render's free tier (the old stack's model loads made the bot deaf ~7-12s
+# at call start).
 fastapi
 uvicorn
+websockets
+sarvamai>=0.1.25
+openai
+httpx
+audioop-lts; python_version >= "3.13"
+python-dotenv
+loguru

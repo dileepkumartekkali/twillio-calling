@@ -1,63 +1,72 @@
-import asyncio
-import os
-import time
+"""Pipecat-free voice agent: Twilio Media Streams <-> Sarvam STT/TTS <-> Groq LLM.
 
+Why no pipecat: on Render's free tier the pipecat stack (onnxruntime, local
+Silero VAD, Smart Turn, worker/bus machinery) burned the container's CPU
+quota per call, and the resulting cgroup throttle debt made the bot deaf for
+~7-12s at call start. This rewrite keeps ZERO local models: Sarvam's
+server-side VAD (vad_signals) does all speech detection, so per-call setup
+is just one STT websocket connect (~1s).
+
+Wire protocols verified against the installed sarvamai SDK and pipecat's
+production-proven Sarvam integration (same audio encoding combination that
+ran successfully for weeks: raw PCM16 @ 8kHz, encoding "audio/wav").
+
+Lessons from the pipecat build, all carried over:
+- Barge-in is transcript-gated (>=2 real words), never raw-VAD-gated: line
+  noise/echo used to cancel replies mid-sentence and repeat the greeting.
+- Idle nudge (5s) / goodbye (10s) in the CALLER'S language, and the timer
+  never counts while the caller's turn is open, a reply is generating, or
+  bot audio is still playing.
+- end_call LLM tool requires a CLEAR explicit request (Llama over-triggers
+  tools on a casual "okay"/"bye").
+- Transcripts are tagged "[xx-IN]" (single token — longer tags broke word
+  counting) so the LLM gets an explicit language signal per turn.
+- TTS language comes from the LLM's OWN reply text, not the caller's input.
+- The greeting is fixed text, pre-synthesized at server startup and cached
+  as raw mu-law — an LLM round-trip for a constant sentence cost 1.5-2.5s.
+"""
+
+import asyncio
+import audioop
+import base64
+import json
+import os
+import re
+import time
+import wave
+from io import BytesIO
+
+import httpx
 from dotenv import load_dotenv
 from loguru import logger
-
-from pipecat.adapters.schemas.function_schema import FunctionSchema
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import (
-    BotStartedSpeakingFrame,
-    BotStoppedSpeakingFrame,
-    EndFrame,
-    FunctionCallResultProperties,
-    LLMTextFrame,
-    TranscriptionFrame,
-    TTSAudioRawFrame,
-    TTSSpeakFrame,
-    VADUserStartedSpeakingFrame,
-    VADUserStoppedSpeakingFrame,
-)
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
-)
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.processors.idle_frame_processor import IdleFrameProcessor
-from pipecat.runner.types import RunnerArguments
-from pipecat.runner.utils import create_transport
-from pipecat.services.groq.llm import GroqLLMService
-from pipecat.services.sarvam.stt import SarvamSTTService
-from pipecat.services.sarvam.tts import SarvamTTSService
-from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
-from pipecat.turns.user_start.min_words_user_turn_start_strategy import MinWordsUserTurnStartStrategy
-from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import (
-    SpeechTimeoutUserTurnStopStrategy,
-)
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from openai import AsyncOpenAI
+from sarvamai import AsyncSarvamAI
+from sarvamai.core.events import EventType
 
 from lang_router import DEFAULT_LANGUAGE, detect_target_language
 
 load_dotenv(override=True)
 
-# Twilio has no documented hard cutoff for Media Streams (unlike Exotel's ~60min
-# plan cap) — TimeLimit is account/config-specific. Keep the same wrap-up window
-# as a UX choice: nobody wants a 55-minute phone-bot call anyway.
-MAX_CALL_SECONDS = 55 * 60
-# Silence handling: nudge once at 5s, hang up at 10s rather than hold a dead line open.
-IDLE_NUDGE_SECONDS = 5
+SAMPLE_RATE = 8000  # Twilio Media Streams: 8kHz mu-law, both directions
 
-# Native-script text for the two idle-timeout messages, keyed by the same Sarvam
-# language codes lang_router.py produces, so the nudge/goodbye speaks in whatever
-# language the call was last using (falls back to English if somehow unset).
-# NOTE: these are machine-drafted translations, not reviewed by a native speaker
-# per language — spot-check with someone fluent before fully trusting on live calls.
+# Twilio has no documented hard cutoff for Media Streams; keep a wrap-up
+# window as a UX choice — nobody wants a 55-minute phone-bot call anyway.
+MAX_CALL_SECONDS = 55 * 60
+IDLE_NUDGE_SECONDS = 5      # silence before "are you there?"
+IDLE_HANGUP_SECONDS = 10    # silence before goodbye + hangup
+TURN_SETTLE_SECONDS = 0.7   # quiet time after last transcript before the LLM turn fires
+MAX_CONCURRENT_CALLS = 3    # ponytail: free tier is one tiny instance; shed load beyond this
+
+GREETING_TEXT = "Hello! How can I help you today?"
+
+LLM_MODEL = "llama-3.3-70b-versatile"
+TTS_MODEL = "bulbul:v3"
+TTS_SPEAKER = "shubh"
+STT_MODEL = "saaras:v3"
+
+# Native-script text for the idle-timeout messages, keyed by the same Sarvam
+# language codes lang_router.py produces. NOTE: machine-drafted translations —
+# spot-check with a fluent speaker before fully trusting on live calls.
 STILL_THERE_MESSAGES = {
     "en-IN": "Are you there?",
     "hi-IN": "क्या आप वहाँ हैं?",
@@ -83,126 +92,11 @@ GOODBYE_MESSAGES = {
     "ml-IN": "ഞാൻ ഇവിടെ കോൾ അവസാനിപ്പിക്കുന്നു. വിട!",
 }
 
-
-class LanguageHintProcessor(FrameProcessor):
-    """Sits between `stt` and the context aggregator. Tags each caller
-    transcript with its script-detected language before it reaches the LLM,
-    instead of leaving language purely to the LLM's own inference from raw
-    text. Reuses the same detect_target_language() already used for TTS
-    voice selection — no extra API call, just another pass over text that's
-    already flowing through here.
-
-    Tagging the transcript itself (not a separate system message) keeps the
-    hint attached to the exact turn it's about, so it can't go stale or get
-    lost among earlier system messages on a long call.
-    """
-
-    async def process_frame(self, frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, TranscriptionFrame) and frame.text:
-            lang = detect_target_language(frame.text)
-            # Compact single-token tag, not a multi-word bracket phrase — a
-            # verbose tag like "[Caller's language: en-IN]" adds ~4 words by
-            # whitespace-count, which inflates MinWordsUserTurnStartStrategy's
-            # word count and would silently defeat its noise-filtering the
-            # moment a real barge-in scenario relies on min_words=2.
-            frame.text = f"[{lang}] {frame.text}"
-            # High-signal marker for reading latency out of Render logs: every
-            # real caller turn logs here, so "time from this line to the next
-            # Bot started speaking line" is the actual end-to-end turn latency,
-            # without having to piece it together from internal DEBUG lines.
-            logger.info(f"TURN START: {frame.text}")
-        await self.push_frame(frame, direction)
-
-
-class IdleResetProcessor(FrameProcessor):
-    """Calls reset_callback() on real activity (caller speech or bot speech
-    start/stop). Needed because IdleFrameProcessor's own retry counter (in
-    on_idle) has no way to know the difference between "silence right after
-    a fresh reset" and "silence that's actually the Nth bout of the whole
-    call" — without this, one legitimate idle firing (e.g. while waiting on
-    a slow LLM response) permanently bumps the counter past the nudge
-    threshold, so the NEXT unrelated idle firing anywhere later in the call
-    hangs up immediately instead of nudging first. Confirmed in a real call
-    log: retry #2 fired 0.8s after the bot finished a normal reply and ended
-    the call outright, because retry #1 had already fired earlier for an
-    unrelated reason.
-    """
-
-    def __init__(self, reset_callback, watch_types):
-        super().__init__()
-        self._reset_callback = reset_callback
-        self._watch_types = tuple(watch_types)
-
-    async def process_frame(self, frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, self._watch_types):
-            self._reset_callback()
-        # Diagnostic breadcrumbs: these VAD frames are broadcast upstream by
-        # the context aggregator and pass through here on their way to Sarvam
-        # STT, whose end-of-speech flush() fires ONLY on the stopped frame.
-        # If these lines never appear in a call's log, Silero VAD isn't firing
-        # (volume/confidence gate) and Sarvam is left to guess utterance ends
-        # server-side — the confirmed cause of 14s transcript-delivery spikes.
-        if isinstance(frame, VADUserStartedSpeakingFrame):
-            logger.info("VAD: user started speaking")
-        elif isinstance(frame, VADUserStoppedSpeakingFrame):
-            logger.info("VAD: user stopped speaking (STT flush should follow)")
-        await self.push_frame(frame, direction)
-
-
-class LanguageRouterProcessor(FrameProcessor):
-    """Sits between `llm` and `tts`. Picks the TTS language from the LLM's OWN
-    reply text as it streams out, not from the caller's transcript.
-
-    Why the reply and not the question: TTS needs to match what's actually about
-    to be spoken. Deriving language from the caller's input assumes the LLM will
-    mirror it exactly; if it ever drifts, TTS would be locked to the wrong
-    language for text that doesn't match. Detecting on the reply itself is
-    self-consistent by construction, and costs nothing extra — same one LLM call,
-    same one TTS call per turn, this is just a stdlib script-count over text that
-    was already flowing through here.
-
-    Not done via an inline LLM-emitted tag (e.g. "[te-IN] reply..."): a tag would
-    get split across streamed token frames and is unreliable to parse mid-stream.
-    """
-
-    def __init__(self, tts: SarvamTTSService, on_first_token=None):
-        super().__init__()
-        self._tts = tts
-        self._reply_so_far = ""
-        self._on_first_token = on_first_token
-
-    async def process_frame(self, frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, TranscriptionFrame):
-            self._reply_so_far = ""  # new user turn starting -> next reply is fresh
-        elif isinstance(frame, LLMTextFrame):
-            if not self._reply_so_far:
-                # First token of this reply — pairs with LanguageHintProcessor's
-                # "TURN START" log to give LLM time-to-first-token straight from
-                # Render logs, without cross-referencing internal metric lines.
-                logger.info("LLM FIRST TOKEN")
-                # Earliest possible signal that a stuck turn has finally
-                # resolved and a real response is happening — confirmed via a
-                # real call log this fires ~1s before the bot's audio actually
-                # starts, which matters for the idle grace-period race below.
-                if self._on_first_token:
-                    self._on_first_token()
-            self._reply_so_far += frame.text
-            lang = detect_target_language(self._reply_so_far)
-            # ponytail: mutates the TTS service's settings object directly — Sarvam's
-            # Pipecat TTS wrapper has no public set_language(). If replies stop
-            # switching language after a pipecat-ai upgrade, check the field name here:
-            #   python -c "from pipecat.services.sarvam.tts import SarvamTTSService as S; print(vars(S.Settings()))"
-            self._tts._settings.language = lang
-        await self.push_frame(frame, direction)
-
-
 SYSTEM_PROMPT = """You are a helpful voice assistant answering a phone call in India.
 
 The caller may speak in English, a single Indian language, or a mix of an Indian
 language and English in the same sentence (e.g. Telugu+English, Hindi+English).
+Each caller message is prefixed with a detected-language tag like "[te-IN]".
 
 Always reply in the SAME language or language-mix the caller just used. If they
 mixed languages, mix your reply the same way — don't switch to pure English or
@@ -220,385 +114,472 @@ garbled speech, or anything you are not sure about — when in doubt, keep
 talking and ask instead of hanging up. Never call it on your own
 initiative. When you do call it, the goodbye is spoken automatically."""
 
-
-class AudioGapMonitor(FrameProcessor):
-    """Sits between `tts` and `transport.output()`. Logs a warning whenever
-    the gap between consecutive TTS audio chunks exceeds a threshold that
-    would be audible as a stutter/dropout — pipecat itself doesn't expose
-    any native signal for this (confirmed: no underrun/buffer/resample
-    logging anywhere in the transport or TTS service source), so this is
-    the concrete thing to grep for if choppy voice ever recurs, instead of
-    re-diagnosing from scratch.
-    """
-
-    GAP_WARNING_THRESHOLD_SECS = 0.3
-
-    def __init__(self):
-        super().__init__()
-        self._last_audio_time = None
-
-    async def process_frame(self, frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, TTSAudioRawFrame):
-            now = time.monotonic()
-            if self._last_audio_time is not None:
-                gap = now - self._last_audio_time
-                if gap > self.GAP_WARNING_THRESHOLD_SECS:
-                    logger.warning(f"AUDIO GAP: {gap:.3f}s between TTS audio chunks — likely audible stutter")
-            self._last_audio_time = now
-        elif isinstance(frame, (BotStartedSpeakingFrame, BotStoppedSpeakingFrame)):
-            # Silence BETWEEN utterances is normal, not a gap to flag — only
-            # measure gaps within a single continuous bit of speech.
-            self._last_audio_time = None
-        await self.push_frame(frame, direction)
-
-
-async def bot(runner_args: RunnerArguments):
-    transport = await create_transport(
-        runner_args,
-        {
-            # TwilioFrameSerializer is built automatically by create_transport and
-            # reads TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN from the environment —
-            # required because auto_hang_up=True (the default) calls Twilio's REST
-            # API to end the call, unlike Exotel which needed no credentials here.
-            "twilio": lambda: FastAPIWebsocketParams(
-                audio_in_enabled=True,
-                audio_out_enabled=True,
-                audio_in_sample_rate=8000,
-                audio_out_sample_rate=8000,
-            ),
-        },
-    )
-
-    stt = SarvamSTTService(
-        api_key=os.getenv("SARVAM_API_KEY"),
-        mode="codemix",  # needs sarvamai>=0.1.25 pinned in requirements.txt, see pipecat-ai/pipecat#3783
-        settings=SarvamSTTService.Settings(model="saaras:v3", language="unknown"),
-    )
-    tts = SarvamTTSService(
-        api_key=os.getenv("SARVAM_API_KEY"),
-        # bulbul:v3 defaults to generating at 24kHz, which then has to be
-        # downsampled to Twilio's required 8kHz on every streamed chunk —
-        # an extra resampling stage on small, frequent chunks is a known
-        # source of choppy/robotic-sounding audio. Generating natively at
-        # 8000 (a Sarvam-documented supported rate) skips that step entirely.
-        sample_rate=8000,
-        settings=SarvamTTSService.Settings(
-            model="bulbul:v3",
-            # "shubh" is Sarvam's own documented default speaker for bulbul:v3 —
-            # no published naturalness ranking exists, but shipping it as the
-            # default is the closest signal to "most tuned" available. A/B test
-            # against "anand" (the previous voice, also valid) if this doesn't
-            # sound right on real calls.
-            voice="shubh",
-            language=DEFAULT_LANGUAGE,  # overwritten per-turn by LanguageRouterProcessor
-            pace=1.0,
-        ),
-    )
-    # Confirmed post-VAD-fix: Sarvam's own LLM is still too slow for a live call
-    # (user-verified, not just the earlier stacked-call artifact). Gemini
-    # 2.5 Flash-Lite was tried next but its free tier's request-per-minute cap
-    # is too tight for a live phone line. Settled on Groq's LPU inference for
-    # speed. Known risk, unresolved: no confirmed evidence Llama reliably
-    # writes native Devanagari/Telugu/Tamil script instead of Romanized
-    # transliteration — watch real calls for this; if TTS keeps landing on
-    # en-IN regardless of what the caller spoke, that's the symptom.
-    llm = GroqLLMService(
-        api_key=os.getenv("GROQ_API_KEY"),
-        settings=GroqLLMService.Settings(model="llama-3.3-70b-versatile"),
-    )
-
-    async def warm_up_groq():
-        # Confirmed via a real call log: the FIRST request on a fresh Groq
-        # client took 9.8s (TLS/connection-pool setup), a later request in
-        # the same call took 0.1s. A new GroqLLMService is created per call
-        # (no cross-call reuse), so every call pays that cost once unless we
-        # pay it here first — fired as a background task so it runs
-        # concurrently with Sarvam STT/TTS connecting, not blocking either.
-        try:
-            await llm._client.chat.completions.create(
-                model=llm._settings.model,
-                messages=[{"role": "user", "content": "hi"}],
-                max_tokens=1,
-            )
-            logger.info("Groq connection warmed up")
-        except Exception:
-            logger.exception("Groq warm-up call failed (non-fatal, continuing)")
-
-    asyncio.create_task(warm_up_groq())
-
-    async def end_call(params):
-        # LLM-driven hangup: the LLM calls this tool when the caller asks to
-        # end the call in ANY language/mix ("call cut chey", "कॉल काट दो",
-        # "hang up"...) — the LLM does the language understanding, so no
-        # brittle per-language keyword list. run_llm=False stops a second
-        # LLM reply from generating; the localized goodbye is spoken here.
-        # call_ending / task / tts are bot() locals defined below this
-        # handler — resolved at call time, long after bot() finishes setup.
-        nonlocal call_ending
-        call_ending = True
-        logger.info("END CALL: caller asked to end the call (LLM tool call)")
-        await params.result_callback(
-            {"status": "ending call"},
-            properties=FunctionCallResultProperties(run_llm=False),
-        )
-        current_lang = tts._settings.language
-        await task.queue_frames(
-            [
-                TTSSpeakFrame(GOODBYE_MESSAGES.get(current_lang, GOODBYE_MESSAGES[DEFAULT_LANGUAGE])),
-                EndFrame(),
-            ]
-        )
-
-    end_call_tool = FunctionSchema(
-        name="end_call",
-        description=(
+END_CALL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "end_call",
+        "description": (
             "End the phone call. Use ONLY when the caller clearly and explicitly "
             "asks to end/cut/stop/hang up the call (any language or mix). Never "
             "use for casual acknowledgments, a passing okay/bye, or unclear "
             "speech — if unsure, do not call this."
         ),
-        properties={},
-        required=[],
-        handler=end_call,
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+# Sentence boundaries incl. Devanagari danda and common Indic terminators.
+_SENTENCE_END = re.compile(r"(?<=[.!?।؟…])\s+")
+
+# Module-level shared clients: connection pools persist ACROSS calls, so no
+# call after the first pays TLS/DNS setup to Groq or Sarvam's REST API (the
+# per-call Groq cold connection measured 9.8s on its first request once).
+# "unset" placeholders: the SDKs reject None at CONSTRUCTION, which would
+# crash the whole server at import when an env var is missing — with a
+# placeholder the failure surfaces at the first API call with a clear 401
+# instead of taking down /health and /voice with it.
+groq = AsyncOpenAI(
+    api_key=os.getenv("GROQ_API_KEY") or "unset",
+    base_url="https://api.groq.com/openai/v1",
+)
+sarvam = AsyncSarvamAI(api_subscription_key=os.getenv("SARVAM_API_KEY") or "unset")
+
+active_calls = 0
+_greeting_ulaw: bytes | None = None
+
+
+def _wav_or_raw_to_ulaw(audio_bytes: bytes) -> bytes:
+    """Convert Sarvam TTS output (WAV container or raw PCM16 @ 8kHz mono) to
+    raw mu-law bytes for Twilio. Sniffs for a RIFF header rather than assuming:
+    Sarvam's REST TTS documents WAV output, but sniffing keeps us correct if a
+    codec/container variant returns headerless PCM.
+    """
+    if audio_bytes[:4] == b"RIFF":
+        with wave.open(BytesIO(audio_bytes), "rb") as w:
+            rate, width, channels = w.getframerate(), w.getsampwidth(), w.getnchannels()
+            pcm = w.readframes(w.getnframes())
+        if channels == 2:
+            pcm = audioop.tomono(pcm, width, 0.5, 0.5)
+        if width != 2:
+            pcm = audioop.lin2lin(pcm, width, 2)
+        if rate != SAMPLE_RATE:
+            pcm, _ = audioop.ratecv(pcm, 2, 1, rate, SAMPLE_RATE, None)
+    else:
+        pcm = audio_bytes  # trust requested format: PCM16 @ 8kHz mono
+    return audioop.lin2ulaw(pcm, 2)
+
+
+async def synthesize_ulaw(text: str, language: str) -> bytes:
+    """Sarvam TTS REST -> raw mu-law 8kHz bytes ready for Twilio."""
+    resp = await sarvam.text_to_speech.convert(
+        text=text,
+        target_language_code=language,
+        speaker=TTS_SPEAKER,
+        model=TTS_MODEL,
+        speech_sample_rate=SAMPLE_RATE,
+        output_audio_codec="linear16",
+        enable_preprocessing=True,
+        pace=1.0,
     )
+    audio = b"".join(base64.b64decode(a) for a in resp.audios)
+    return _wav_or_raw_to_ulaw(audio)
 
-    context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}], tools=[end_call_tool])
-    # Without a VAD analyzer, TurnAnalyzerUserTurnStopStrategy never sees a real
-    # VADUserStoppedSpeakingFrame and falls back to firing "turn stopped" on a
-    # blind ~1s timeout after EVERY transcript — so one utterance can trigger
-    # multiple stacked LLM calls with growing context, which is what caused the
-    # repeated/overlapping replies when a caller tried to interrupt. Silero VAD
-    # restores real silence-based turn detection (and lets Sarvam STT's own
-    # VAD-gated flush() fire at the right time too).
-    context_aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
-            # min_volume=0: rely on Silero's neural confidence (0.7, unchanged)
-            # alone as the voice detector. The volume floor is an EBU-R128
-            # loudness gate ANDed with confidence — compressed 8kHz mu-law
-            # phone audio is quiet, and even at the previously-lowered 0.4 a
-            # soft-spoken caller can ride under it, so the VAD misses their
-            # speech entirely. When VAD misses speech: Sarvam STT's
-            # end-of-speech flush() never runs (14.2s transcript spikes
-            # measured), AND nothing resets the idle timer while the caller
-            # is mid-sentence — so the call can be "ended" while they're
-            # still talking. Silero's confidence gate keeps line noise out;
-            # the redundant volume floor costs more than it protects here.
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2, min_volume=0)),
-            # Default start strategy (VADUserTurnStartStrategy) triggers a barge-in
-            # on ANY audio energy, including noise or the bot's own voice leaking
-            # back on the line (no echo cancellation on this call) — confirmed in
-            # a real call log: false triggers repeatedly cancelled the greeting
-            # mid-sentence and restarted the turn cycle, producing "how can I help
-            # you" 2-3 times in a row. MinWordsUserTurnStartStrategy requires 2+
-            # actually-transcribed words to interrupt the bot while it's speaking
-            # (only 1 word when it isn't, so normal turns still start immediately) —
-            # filters out noise/echo blips without slowing down real conversation.
-            # Stop strategy: SpeechTimeoutUserTurnStopStrategy (VAD + timers)
-            # instead of the default TurnAnalyzerUserTurnStopStrategy, which
-            # loads and runs the Smart Turn ONNX model. On Render's 0.1-CPU
-            # free tier the model load per call burns the cgroup CPU quota and
-            # the resulting throttle debt is what the consistent ~7s
-            # "added worker -> starting worker" stall in every call log
-            # actually is — the bot is deaf that entire time (words spoken
-            # before Sarvam STT connects are lost, which is why callers had
-            # to repeat "hello"). Its per-turn inference also competes with
-            # live audio streaming for the same CPU slice (the AUDIO GAP
-            # stutters). VAD is confirmed firing since the min_volume fix, so
-            # the VAD-timer strategy is reliable now, and it keeps the same
-            # STT-latency safety net and transcript fallback. Tradeoff given
-            # up: semantic end-of-turn detection (knowing a trailing "I want
-            # to..." isn't finished) — silence-based stop only.
-            user_turn_strategies=UserTurnStrategies(
-                start=[MinWordsUserTurnStartStrategy(min_words=2)],
-                stop=[SpeechTimeoutUserTurnStopStrategy()],
-            ),
-        ),
-    )
-    lang_hint = LanguageHintProcessor()
-    audio_gap_monitor = AudioGapMonitor()
 
-    idle_retries = 0
-    call_ending = False
-    user_turn_active = False
+async def warm_up():
+    """Run once at server startup (NOT per call): pre-synthesize the greeting
+    and open warm connections to Groq and Sarvam so the first call is fast.
+    Failures are non-fatal — everything falls back to on-demand.
+    """
+    global _greeting_ulaw
+    try:
+        _greeting_ulaw = await synthesize_ulaw(GREETING_TEXT, "en-IN")
+        logger.info(f"Greeting pre-synthesized: {len(_greeting_ulaw)} bytes mu-law")
+    except Exception:
+        logger.exception("Greeting pre-synthesis failed (will synthesize on demand)")
+    try:
+        await groq.chat.completions.create(
+            model=LLM_MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=1
+        )
+        logger.info("Groq connection warmed up")
+    except Exception:
+        logger.exception("Groq warm-up failed (non-fatal)")
 
-    def reset_idle_retries():
-        nonlocal idle_retries, call_ending
-        if idle_retries or call_ending:
-            logger.info("IDLE: real activity resumed, resetting retry counter")
-        idle_retries = 0
-        # Aborts a pending end-call decision too — see the grace period below.
-        call_ending = False
 
-    # THE authoritative fix for the hangup-during-stuck-turn race. Root cause,
-    # measured in a real call log: Sarvam STT's transcript delivery has huge
-    # tail latency (14.2s TTFB observed in the same call where other
-    # transcripts took 0.07s), and pipecat's turn-stop machinery waits for
-    # the transcript before letting the LLM fire — so the caller's turn sits
-    # "open" for that entire time with zero frames flowing, the idle timer
-    # reads it as dead air, and no fixed-length grace period can outwait an
-    # unbounded STT delay (the 5s grace expired 6s before the stuck
-    # transcript landed). But pipecat KNOWS the turn is open the whole time —
-    # so instead of guessing with timers, refuse to count idle time or end
-    # the call while a user turn is in progress.
-    user_aggregator = context_aggregator.user()
+async def _twilio_hangup(call_sid: str):
+    """End the call via Twilio's REST API (same mechanism pipecat's serializer used)."""
+    sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+    token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Calls/{call_sid}.json"
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(url, data={"Status": "completed"}, auth=(sid, token))
+        logger.info(f"Twilio hangup for {call_sid}: HTTP {r.status_code}")
+    except Exception:
+        logger.exception("Twilio REST hangup failed")
 
-    @user_aggregator.event_handler("on_user_turn_started")
-    async def on_user_turn_started(aggregator, strategy):
-        nonlocal user_turn_active
-        user_turn_active = True
-        reset_idle_retries()
 
-    @user_aggregator.event_handler("on_user_turn_stopped")
-    async def on_user_turn_stopped(aggregator, strategy, message):
-        nonlocal user_turn_active
-        user_turn_active = False
+class CallSession:
+    """One phone call: owns the Twilio websocket and all per-call tasks."""
 
-    # Also reset on the LLM's first token (not just caller speech/bot-speaking
-    # frames) — confirmed via a real call log this fires ~1s before the bot's
-    # audio actually starts, which is the margin that made the difference
-    # between the grace period below catching a stuck-turn resolution vs missing it.
-    lang_router = LanguageRouterProcessor(tts, on_first_token=reset_idle_retries)
+    def __init__(self, websocket, stream_sid: str, call_sid: str):
+        self.ws = websocket
+        self.stream_sid = stream_sid
+        self.call_sid = call_sid
 
-    async def on_idle(processor):
-        nonlocal idle_retries, call_ending
-        # IdleFrameProcessor's own loop keeps firing on_idle every timeout
-        # indefinitely — it has no concept of "we already decided to end this
-        # call." Confirmed in a real call log: goodbye + EndFrame got queued
-        # TWICE more (retry #2, then retry #3) after the first "ending call",
-        # because the call hadn't actually torn down yet when the next timeout
-        # fired. This guard makes the ending decision fire exactly once.
-        if call_ending:
+        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.current_lang = DEFAULT_LANGUAGE  # last language the bot SPOKE in
+
+        # Turn state (timestamps instead of frame plumbing)
+        self.transcript_buffer: list[str] = []
+        self.last_transcript_time = 0.0
+        self.user_speaking = False            # Sarvam server VAD START/END_SPEECH
+        self.last_activity = time.monotonic() # caller-side activity only
+        self.nudged = False
+        self.call_ending = False
+
+        # Bot output state
+        self.marks_pending = 0                # Twilio echoes marks when audio has PLAYED
+        self.gen_task: asyncio.Task | None = None
+        self._mark_counter = 0
+
+        self._stt_ctx = None
+        self._stt_socket = None
+        self._bg_tasks: list[asyncio.Task] = []
+
+    # ---------------- Twilio output ----------------
+
+    async def send_ulaw(self, ulaw: bytes):
+        """Send raw mu-law audio to Twilio, followed by a playback mark."""
+        CHUNK = 4000  # 0.5s per media message; Twilio buffers ahead happily
+        for i in range(0, len(ulaw), CHUNK):
+            await self.ws.send_text(json.dumps({
+                "event": "media",
+                "streamSid": self.stream_sid,
+                "media": {"payload": base64.b64encode(ulaw[i:i + CHUNK]).decode()},
+            }))
+        self._mark_counter += 1
+        self.marks_pending += 1
+        await self.ws.send_text(json.dumps({
+            "event": "mark",
+            "streamSid": self.stream_sid,
+            "mark": {"name": f"m{self._mark_counter}"},
+        }))
+
+    async def clear_twilio_audio(self):
+        """Wipe Twilio's buffered audio (barge-in). Twilio returns pending
+        marks after a clear; we also zero the counter so bot_speaking state
+        can't get stuck if it doesn't."""
+        await self.ws.send_text(json.dumps({"event": "clear", "streamSid": self.stream_sid}))
+        self.marks_pending = 0
+
+    async def speak(self, text: str, language: str):
+        try:
+            ulaw = await synthesize_ulaw(text, language)
+            await self.send_ulaw(ulaw)
+        except Exception:
+            logger.exception(f"TTS failed for: {text[:60]!r} ({language})")
+
+    @property
+    def bot_speaking(self) -> bool:
+        return self.marks_pending > 0
+
+    # ---------------- STT ----------------
+
+    async def connect_stt(self):
+        self._stt_ctx = sarvam.speech_to_text_streaming.connect(
+            model=STT_MODEL,
+            language_code="unknown",
+            mode="codemix",
+            sample_rate=str(SAMPLE_RATE),
+            # Server-side VAD: Sarvam detects speech start/end and finalizes
+            # utterances itself — no local VAD model, no flush choreography
+            # (the local-VAD flush chain was the source of the 14s transcript
+            # spikes and the CPU cost of Silero/SmartTurn on the old build).
+            vad_signals="true",
+            high_vad_sensitivity="true",
+        )
+        self._stt_socket = await self._stt_ctx.__aenter__()
+        self._stt_socket.on(EventType.MESSAGE, self._on_stt_message_sync)
+        self._bg_tasks.append(asyncio.create_task(self._stt_listener()))
+        logger.info("Sarvam STT connected (server-side VAD)")
+
+    async def _stt_listener(self):
+        try:
+            await self._stt_socket.start_listening()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("STT listener died")
+
+    def _on_stt_message_sync(self, message):
+        # SDK callbacks are sync; hop back into async land.
+        asyncio.create_task(self._on_stt_message(message))
+
+    async def _on_stt_message(self, message):
+        try:
+            if message.type == "events":
+                signal = message.data.signal_type
+                if signal == "START_SPEECH":
+                    self.user_speaking = True
+                    self.last_activity = time.monotonic()
+                    logger.info("VAD(server): user started speaking")
+                elif signal == "END_SPEECH":
+                    self.user_speaking = False
+                    self.last_activity = time.monotonic()
+                    logger.info("VAD(server): user stopped speaking")
+            elif message.type == "data":
+                transcript = (message.data.transcript or "").strip()
+                if not transcript:
+                    return  # empty/silence transcript: never trigger a turn (old known gap)
+                lang = detect_target_language(transcript)
+                tagged = f"[{lang}] {transcript}"
+                logger.info(f"TURN START: {tagged}")
+                self.last_activity = time.monotonic()
+                self.nudged = False
+
+                # Barge-in: transcript-gated, >=2 real words while bot output
+                # is in flight (raw VAD blips used to falsely cancel replies).
+                if self.bot_speaking or (self.gen_task and not self.gen_task.done()):
+                    if len(transcript.split()) >= 2:
+                        logger.info("BARGE-IN: interrupting bot output")
+                        if self.gen_task and not self.gen_task.done():
+                            self.gen_task.cancel()
+                        await self.clear_twilio_audio()
+                    else:
+                        logger.info("Ignoring 1-word blip while bot speaking (noise guard)")
+                        return
+
+                self.transcript_buffer.append(tagged)
+                self.last_transcript_time = time.monotonic()
+        except Exception:
+            logger.exception("Error handling STT message")
+
+    async def feed_audio(self, ulaw_b64: str):
+        """Twilio media payload (base64 mu-law) -> PCM16 -> Sarvam STT."""
+        if not self._stt_socket:
             return
-        if user_turn_active:
-            # The caller HAS spoken — we're waiting on Sarvam STT to deliver
-            # the transcript (up to 14s observed). Not silence; don't count it.
-            logger.info("IDLE FIRED but a user turn is open (STT transcript pending) — not counting")
-            return
-        idle_retries += 1
-        logger.info(f"IDLE FIRED: retry #{idle_retries} (timeout={IDLE_NUDGE_SECONDS}s)")
-        # tts._settings.language is kept current by LanguageRouterProcessor from
-        # the last real turn, so these messages land in whatever language the
-        # call was actually using — not hardcoded English regardless of caller.
-        current_lang = tts._settings.language
-        if idle_retries == 1:
-            await processor.push_frame(
-                TTSSpeakFrame(STILL_THERE_MESSAGES.get(current_lang, STILL_THERE_MESSAGES[DEFAULT_LANGUAGE]))
-            )
-        else:
-            # Confirmed in a real call log: a caller's earlier utterance can get
-            # stuck in pipecat's own turn-completion machinery (repeated speech
-            # resets its internal timer) and only resolve well after we've
-            # already decided the call is idle. First attempt at this fix used
-            # a 2s grace window — verified against the exact log timestamps
-            # afterward and it was NOT long enough: the LLM's first token
-            # landed at +2.4s and TTS audio at +2.5s, both past a 2s cutoff.
-            # Using IDLE_NUDGE_SECONDS gives comfortable margin over the
-            # ~2.5s gap actually observed, and lang_router's on_first_token
-            # hook (added alongside this) resets on the LLM's first token
-            # specifically, ~1s before audio would, rather than waiting for
-            # BotStartedSpeakingFrame as the only signal.
-            call_ending = True
-            logger.info("IDLE: grace period before ending call (checking for an in-flight response)")
-            await asyncio.sleep(IDLE_NUDGE_SECONDS)
-            # user_turn_active re-check: a turn opening mid-grace already clears
-            # call_ending via on_user_turn_started -> reset_idle_retries, but
-            # check it explicitly too so the two guards can't drift apart.
-            if call_ending and not user_turn_active:
-                logger.info("IDLE: ending call")
-                await processor.push_frame(
-                    TTSSpeakFrame(GOODBYE_MESSAGES.get(current_lang, GOODBYE_MESSAGES[DEFAULT_LANGUAGE]))
-                )
-                await processor.push_frame(EndFrame())
-            else:
-                logger.info("IDLE: activity arrived during grace period, call continues")
-
-    # Also watch Bot{Started,Stopped}SpeakingFrame (pushed upstream by the output
-    # transport, so they do reach this position) — without them, the idle timer
-    # only resets on caller speech, so a 5s timeout fires WHILE the bot is still
-    # generating/speaking its own reply (no new caller transcript arrives during
-    # that gap), misreading normal turn latency as caller silence and cutting
-    # the call mid-conversation. Now it resets on either side's activity, so it
-    # only fires on genuine dead air from both parties.
-    # VADUserStarted/StoppedSpeakingFrame included too (broadcast upstream by
-    # the aggregator, so they pass through this position): raw speech detection
-    # counts as activity the moment the caller's voice starts, without waiting
-    # for the transcript — which Sarvam can take seconds to deliver.
-    _activity_frames = [
-        TranscriptionFrame,
-        BotStartedSpeakingFrame,
-        BotStoppedSpeakingFrame,
-        VADUserStartedSpeakingFrame,
-        VADUserStoppedSpeakingFrame,
-    ]
-    idle_guard = IdleFrameProcessor(
-        callback=on_idle,
-        timeout=IDLE_NUDGE_SECONDS,
-        types=_activity_frames,
-    )
-    idle_reset = IdleResetProcessor(
-        reset_idle_retries,
-        watch_types=_activity_frames,
-    )
-
-    pipeline = Pipeline(
-        [
-            transport.input(),
-            stt,
-            lang_hint,
-            idle_guard,
-            idle_reset,
-            context_aggregator.user(),
-            llm,
-            lang_router,
-            tts,
-            audio_gap_monitor,
-            transport.output(),
-            context_aggregator.assistant(),
-        ]
-    )
-
-    # `allow_interruptions` was removed from PipelineParams in pipecat-ai 1.5.0 (moved to
-    # per-aggregator turn strategies) — barge-in is on by default without setting anything here.
-    task = PipelineTask(
-        pipeline,
-        params=PipelineParams(
-            audio_in_sample_rate=8000,
-            audio_out_sample_rate=8000,
-            enable_metrics=True,  # per-turn TTFB/processing time in logs, for real latency numbers
-        ),
-    )
-
-    async def end_call_before_provider_cutoff():
-        await asyncio.sleep(MAX_CALL_SECONDS)
-        await task.queue_frames(
-            [TTSSpeakFrame("We're close to the time limit for this call, ending here now."), EndFrame()]
+        pcm = audioop.ulaw2lin(base64.b64decode(ulaw_b64), 2)
+        # Same proven combination pipecat ran in production: raw PCM16 bytes,
+        # encoding "audio/wav", sample_rate 8000.
+        await self._stt_socket.transcribe(
+            audio=base64.b64encode(pcm).decode(),
+            encoding="audio/wav",
+            sample_rate=SAMPLE_RATE,
         )
 
-    call_timer = asyncio.create_task(end_call_before_provider_cutoff())
+    # ---------------- LLM turn ----------------
 
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
-        # Fixed-text greeting via TTSSpeakFrame, not an LLM round-trip: the
-        # greeting text never varies ("greet in English" is a requirement),
-        # so composing it live with Groq cost 1.5-2.5s of LLM+aggregation
-        # latency per call at the moment callers are most impatient — and
-        # earlier it also let the LLM pick Hindi on its own. Deterministic
-        # text kills both. TTSSpeakFrame output lands in the LLM context as
-        # an assistant message (confirmed in real call logs — the idle
-        # nudges show up there), so the LLM knows it already greeted.
-        await task.queue_frames([TTSSpeakFrame("Hello! How can I help you today?")])
+    async def _turn_manager(self):
+        """Fire an LLM turn once transcripts have settled and the caller isn't
+        mid-speech. Timestamp loop — no frame machinery to deadlock."""
+        while True:
+            await asyncio.sleep(0.15)
+            if not self.transcript_buffer or self.user_speaking or self.call_ending:
+                continue
+            if time.monotonic() - self.last_transcript_time < TURN_SETTLE_SECONDS:
+                continue
+            if self.gen_task and not self.gen_task.done():
+                continue
+            user_text = " ".join(self.transcript_buffer)
+            self.transcript_buffer.clear()
+            self.gen_task = asyncio.create_task(self._run_llm_turn(user_text))
 
-    @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport, client):
-        call_timer.cancel()
-        await task.cancel()
+    async def _run_llm_turn(self, user_text: str):
+        self.messages.append({"role": "user", "content": user_text})
+        reply_so_far = ""   # everything the LLM produced (language detection + history)
+        buffer = ""         # text not yet sent to TTS
+        end_call_requested = False
+        try:
+            t0 = time.monotonic()
+            stream = await groq.chat.completions.create(
+                model=LLM_MODEL,
+                messages=self.messages,
+                tools=[END_CALL_TOOL],
+                stream=True,
+                max_tokens=300,
+            )
+            first_token = True
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        if tc.function and tc.function.name == "end_call":
+                            end_call_requested = True
+                if delta.content:
+                    if first_token:
+                        logger.info(f"LLM FIRST TOKEN (+{time.monotonic() - t0:.2f}s)")
+                        first_token = False
+                    reply_so_far += delta.content
+                    buffer += delta.content
+                    # Speak each completed sentence while the rest streams.
+                    parts = _SENTENCE_END.split(buffer)
+                    buffer = parts[-1]  # incomplete tail stays buffered
+                    for sentence in parts[:-1]:
+                        if sentence.strip():
+                            await self._speak_reply_sentence(sentence.strip(), reply_so_far)
+            if buffer.strip():
+                await self._speak_reply_sentence(buffer.strip(), reply_so_far)
+                buffer = ""
+            if reply_so_far.strip():
+                self.messages.append({"role": "assistant", "content": reply_so_far.strip()})
+            if end_call_requested:
+                logger.info("END CALL: caller asked to end the call (LLM tool call)")
+                await self.end_call()
+        except asyncio.CancelledError:
+            # Barge-in: keep whatever was already SPOKEN in context so the
+            # LLM knows it was cut off mid-reply.
+            spoken = reply_so_far[: len(reply_so_far) - len(buffer)].strip()
+            if spoken:
+                self.messages.append({"role": "assistant", "content": spoken + " —"})
+            raise
+        except Exception:
+            logger.exception("LLM turn failed")
 
-    runner = PipelineRunner(handle_sigint=False)
+    async def _speak_reply_sentence(self, sentence: str, reply_so_far: str):
+        # TTS language from the LLM's OWN reply so voice matches the words
+        # actually spoken (detecting on caller input drifts when the LLM does).
+        lang = detect_target_language(reply_so_far)
+        self.current_lang = lang
+        await self.speak(sentence, lang)
+
+    # ---------------- Idle watchdog ----------------
+
+    async def _idle_watchdog(self):
+        """Nudge at 5s of genuine dead air, goodbye+hangup at 10s.
+        Never counts while: caller is mid-speech, a transcript is buffered, a
+        reply is generating, or bot audio is still playing — every one of
+        those was a premature-hangup bug on the old build."""
+        while True:
+            await asyncio.sleep(0.5)
+            if self.call_ending:
+                continue
+            busy = (
+                self.user_speaking
+                or self.transcript_buffer
+                or (self.gen_task and not self.gen_task.done())
+                or self.bot_speaking
+            )
+            if busy:
+                continue
+            idle = time.monotonic() - self.last_activity
+            if idle >= IDLE_HANGUP_SECONDS and self.nudged:
+                logger.info("IDLE: ending call")
+                await self.end_call()
+            elif idle >= IDLE_NUDGE_SECONDS and not self.nudged:
+                self.nudged = True
+                logger.info("IDLE: nudging caller")
+                await self.speak(
+                    STILL_THERE_MESSAGES.get(self.current_lang, STILL_THERE_MESSAGES[DEFAULT_LANGUAGE]),
+                    self.current_lang if self.current_lang in STILL_THERE_MESSAGES else DEFAULT_LANGUAGE,
+                )
+                # The nudge does NOT reset last_activity — only real caller
+                # activity does, so goodbye stays anchored to the same silence.
+
+    async def _call_length_limit(self):
+        await asyncio.sleep(MAX_CALL_SECONDS)
+        logger.info("MAX CALL LENGTH reached, wrapping up")
+        await self.end_call()
+
+    async def end_call(self):
+        if self.call_ending:
+            return  # fire exactly once (old bug: goodbye+hangup queued repeatedly)
+        self.call_ending = True
+        lang = self.current_lang if self.current_lang in GOODBYE_MESSAGES else DEFAULT_LANGUAGE
+        await self.speak(GOODBYE_MESSAGES[lang], lang)
+        # Give Twilio time to play the goodbye out before killing the call.
+        for _ in range(40):  # up to 4s
+            if not self.bot_speaking:
+                break
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(0.3)
+        await _twilio_hangup(self.call_sid)
+
+    # ---------------- Main loop ----------------
+
+    async def run(self):
+        """Drive the call: greeting immediately, then relay Twilio media."""
+        try:
+            # Greeting first — cached bytes, hearable before STT even connects.
+            if _greeting_ulaw:
+                await self.send_ulaw(_greeting_ulaw)
+                self.messages.append({"role": "assistant", "content": GREETING_TEXT})
+                logger.info("Greeting sent from cache")
+            else:
+                asyncio.create_task(self._greet_on_demand())
+
+            await self.connect_stt()
+            self.last_activity = time.monotonic()
+
+            self._bg_tasks.append(asyncio.create_task(self._turn_manager()))
+            self._bg_tasks.append(asyncio.create_task(self._idle_watchdog()))
+            self._bg_tasks.append(asyncio.create_task(self._call_length_limit()))
+
+            while True:
+                raw = await self.ws.receive_text()
+                msg = json.loads(raw)
+                event = msg.get("event")
+                if event == "media":
+                    await self.feed_audio(msg["media"]["payload"])
+                elif event == "mark":
+                    self.marks_pending = max(0, self.marks_pending - 1)
+                elif event == "stop":
+                    logger.info("Twilio sent stop — call over")
+                    break
+        except Exception as e:
+            # WebSocketDisconnect lands here too — normal caller hangup.
+            logger.info(f"Call loop ended: {type(e).__name__}: {e}")
+        finally:
+            await self._cleanup()
+
+    async def _greet_on_demand(self):
+        global _greeting_ulaw
+        try:
+            _greeting_ulaw = await synthesize_ulaw(GREETING_TEXT, "en-IN")
+            await self.send_ulaw(_greeting_ulaw)
+            self.messages.append({"role": "assistant", "content": GREETING_TEXT})
+            logger.info("Greeting synthesized on demand")
+        except Exception:
+            logger.exception("On-demand greeting failed")
+
+    async def _cleanup(self):
+        for t in self._bg_tasks:
+            t.cancel()
+        if self.gen_task and not self.gen_task.done():
+            self.gen_task.cancel()
+        if self._stt_ctx and self._stt_socket:
+            try:
+                await self._stt_ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
+        logger.info(f"Call {self.call_sid} cleaned up")
+
+
+async def handle_twilio_ws(websocket):
+    """Entry point from server.py: parse Twilio's handshake, run the session."""
+    global active_calls
+    stream_sid = call_sid = None
+    # Twilio sends "connected" then "start"; media only after that.
+    while True:
+        msg = json.loads(await websocket.receive_text())
+        if msg.get("event") == "start":
+            stream_sid = msg["start"]["streamSid"]
+            call_sid = msg["start"]["callSid"]
+            break
+        if msg.get("event") == "stop":
+            return
+
+    if active_calls >= MAX_CONCURRENT_CALLS:
+        logger.warning("Call rejected: concurrency cap reached")
+        await websocket.close()
+        return
+
+    active_calls += 1
+    logger.info(f"Call started: {call_sid} (stream {stream_sid}), active={active_calls}")
     try:
-        await runner.run(task)
+        await CallSession(websocket, stream_sid, call_sid).run()
     except Exception:
-        logger.exception("Pipeline crashed mid-call")
+        logger.exception("Call session crashed")
     finally:
-        call_timer.cancel()
+        active_calls -= 1
