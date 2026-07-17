@@ -323,10 +323,12 @@ async def bot(runner_args: RunnerArguments):
     call_ending = False
 
     def reset_idle_retries():
-        nonlocal idle_retries
-        if idle_retries:
+        nonlocal idle_retries, call_ending
+        if idle_retries or call_ending:
             logger.info("IDLE: real activity resumed, resetting retry counter")
         idle_retries = 0
+        # Aborts a pending end-call decision too — see the grace period below.
+        call_ending = False
 
     async def on_idle(processor):
         nonlocal idle_retries, call_ending
@@ -349,12 +351,25 @@ async def bot(runner_args: RunnerArguments):
                 TTSSpeakFrame(STILL_THERE_MESSAGES.get(current_lang, STILL_THERE_MESSAGES[DEFAULT_LANGUAGE]))
             )
         else:
+            # Confirmed in a real call log: a caller's earlier utterance can get
+            # stuck in pipecat's own turn-completion machinery (repeated speech
+            # resets its internal timer) and only resolve well after we've
+            # already decided the call is idle — the real reply started
+            # generating 1.8s after this decision fired, and lost the race
+            # against the EndFrame reaching Twilio's auto-hangup. Give any
+            # in-flight response a grace window to arrive and cancel the
+            # ending (via reset_idle_retries) before we actually commit to it.
             call_ending = True
-            logger.info("IDLE: ending call")
-            await processor.push_frame(
-                TTSSpeakFrame(GOODBYE_MESSAGES.get(current_lang, GOODBYE_MESSAGES[DEFAULT_LANGUAGE]))
-            )
-            await processor.push_frame(EndFrame())
+            logger.info("IDLE: grace period before ending call (checking for an in-flight response)")
+            await asyncio.sleep(2)
+            if call_ending:
+                logger.info("IDLE: ending call")
+                await processor.push_frame(
+                    TTSSpeakFrame(GOODBYE_MESSAGES.get(current_lang, GOODBYE_MESSAGES[DEFAULT_LANGUAGE]))
+                )
+                await processor.push_frame(EndFrame())
+            else:
+                logger.info("IDLE: activity arrived during grace period, call continues")
 
     # Also watch Bot{Started,Stopped}SpeakingFrame (pushed upstream by the output
     # transport, so they do reach this position) — without them, the idle timer
