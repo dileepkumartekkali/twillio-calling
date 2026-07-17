@@ -346,6 +346,26 @@ async def test_echo_guard():
     print("PASS echo guard: bot's own echoed speech ignored, real barge-in still works")
 
 
+async def test_outbound_pacing():
+    """Audio must leave at ~real-time rate (with the small lead cushion),
+    not as an instant dump — instant dumping meant barge-in cleared seconds
+    of buffered audio mid-word (the 'voice breaking terribly' report)."""
+    ws, s = make_session([])
+    one_second = b"\x00" * 8000  # 1s of mu-law
+    t0 = time.monotonic()
+    await s.send_ulaw(one_second)
+    # wait for all 5 chunks + mark to hit the fake ws
+    while len(ws.events("media")) < 5:
+        await asyncio.sleep(0.02)
+    elapsed = time.monotonic() - t0
+    # 1s of audio minus the 0.4s lead cushion minus one 0.2s chunk granule
+    # => at least ~0.4s of real pacing (instant dumping would be ~0.00s)
+    assert elapsed >= 0.35, f"audio dumped instantly ({elapsed:.2f}s for 1s of audio)"
+    assert ws.events("mark"), "mark must follow the audio"
+    await stop_session(s)
+    print(f"PASS outbound pacing: 1s of audio took {elapsed:.2f}s to send (lead cushion 0.4s)")
+
+
 async def main():
     test_wav_to_ulaw()
     await test_handshake_and_media_flow()
@@ -357,6 +377,7 @@ async def main():
     await test_idle_resets_when_user_returns()
     await test_bot_reply_end_restarts_silence_clock()
     await test_echo_guard()
+    await test_outbound_pacing()
     await test_end_call_tool()
     await test_language_flow()
     print("\nall agent self-checks passed")

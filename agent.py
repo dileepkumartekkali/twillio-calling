@@ -242,6 +242,8 @@ class CallSession:
         self.gen_task: asyncio.Task | None = None
         self._mark_counter = 0
         self._recent_bot_text = ""            # rolling tail of what the bot said (echo guard)
+        self._out_q: asyncio.Queue = asyncio.Queue()  # paced outbound audio/marks
+        self._sender_started = False
 
         self._stt_ctx = None
         self._stt_socket = None
@@ -254,26 +256,61 @@ class CallSession:
     # ---------------- Twilio output ----------------
 
     async def send_ulaw(self, ulaw: bytes):
-        """Send raw mu-law audio to Twilio, followed by a playback mark."""
-        CHUNK = 4000  # 0.5s per media message; Twilio buffers ahead happily
+        """Queue raw mu-law audio for PACED delivery to Twilio, followed by a
+        playback mark. Real-time pacing (not instant dumping) is what pipecat
+        did and what the first cut of this rewrite got wrong: dumping whole
+        sentences into Twilio's buffer meant any barge-in `clear` chopped
+        seconds of audio mid-word — heard as terrible voice breaking."""
+        self._ensure_sender()
+        CHUNK = 1600  # 200ms per media message
         for i in range(0, len(ulaw), CHUNK):
+            await self._out_q.put(("audio", ulaw[i:i + CHUNK]))
+        self._mark_counter += 1
+        self.marks_pending += 1
+        await self._out_q.put(("mark", f"m{self._mark_counter}"))
+
+    def _ensure_sender(self):
+        if not self._sender_started:
+            self._sender_started = True
+            self._bg_tasks.append(asyncio.create_task(self._output_sender()))
+
+    async def _output_sender(self):
+        """Send queued audio at real-time rate with a small jitter cushion.
+        Keeps at most ~LEAD+0.2s buffered at Twilio, so an interruption stops
+        the voice almost immediately and event-loop hiccups don't stutter."""
+        LEAD = 0.4  # how far ahead of real time we allow Twilio's buffer to run
+        next_time = 0.0
+        while True:
+            kind, payload = await self._out_q.get()
+            if kind == "mark":
+                await self.ws.send_text(json.dumps({
+                    "event": "mark",
+                    "streamSid": self.stream_sid,
+                    "mark": {"name": payload},
+                }))
+                continue
+            now = time.monotonic()
+            if next_time and now - next_time > 0.5:
+                logger.warning(f"OUTBOUND AUDIO STALL: sender {now - next_time:.2f}s behind schedule")
+            next_time = max(next_time, now - LEAD)
+            if next_time > now:
+                await asyncio.sleep(next_time - now)
             await self.ws.send_text(json.dumps({
                 "event": "media",
                 "streamSid": self.stream_sid,
-                "media": {"payload": base64.b64encode(ulaw[i:i + CHUNK]).decode()},
+                "media": {"payload": base64.b64encode(payload).decode()},
             }))
-        self._mark_counter += 1
-        self.marks_pending += 1
-        await self.ws.send_text(json.dumps({
-            "event": "mark",
-            "streamSid": self.stream_sid,
-            "mark": {"name": f"m{self._mark_counter}"},
-        }))
+            next_time += len(payload) / float(SAMPLE_RATE)  # mu-law: 1 byte/sample
 
     async def clear_twilio_audio(self):
-        """Wipe Twilio's buffered audio (barge-in). Twilio returns pending
-        marks after a clear; we also zero the counter so bot_speaking state
-        can't get stuck if it doesn't."""
+        """Barge-in: drop our queued audio, wipe Twilio's (small) buffer.
+        Twilio returns pending marks after a clear; we also zero the counter
+        so bot_speaking state can't get stuck if it doesn't."""
+        try:
+            while True:
+                self._out_q.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
         await self.ws.send_text(json.dumps({"event": "clear", "streamSid": self.stream_sid}))
         self.marks_pending = 0
 
@@ -317,7 +354,10 @@ class CallSession:
             # (the local-VAD flush chain was the source of the 14s transcript
             # spikes and the CPU cost of Silero/SmartTurn on the old build).
             vad_signals="true",
-            high_vad_sensitivity="true",
+            # high_vad_sensitivity deliberately NOT set: enabling it was an
+            # unverified guess in the first cut, and higher sensitivity means
+            # more false speech events + junk transcripts on an echoey phone
+            # line — each one a chance to chop the bot's reply mid-sentence.
         )
         self._stt_socket = await self._stt_ctx.__aenter__()
         self._stt_socket.on(EventType.MESSAGE, self._on_stt_message_sync)
@@ -519,8 +559,9 @@ class CallSession:
         self.call_ending = True
         lang = self.current_lang if self.current_lang in GOODBYE_MESSAGES else DEFAULT_LANGUAGE
         await self.speak(GOODBYE_MESSAGES[lang], lang)
-        # Give Twilio time to play the goodbye out before killing the call.
-        for _ in range(40):  # up to 4s
+        # Give Twilio time to play the goodbye out before killing the call
+        # (paced delivery means a ~3s goodbye takes ~3s to drain).
+        for _ in range(80):  # up to 8s
             if not self.bot_speaking:
                 break
             await asyncio.sleep(0.1)
