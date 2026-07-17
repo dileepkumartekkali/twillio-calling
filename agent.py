@@ -102,6 +102,32 @@ class LanguageHintProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class IdleResetProcessor(FrameProcessor):
+    """Calls reset_callback() on real activity (caller speech or bot speech
+    start/stop). Needed because IdleFrameProcessor's own retry counter (in
+    on_idle) has no way to know the difference between "silence right after
+    a fresh reset" and "silence that's actually the Nth bout of the whole
+    call" — without this, one legitimate idle firing (e.g. while waiting on
+    a slow LLM response) permanently bumps the counter past the nudge
+    threshold, so the NEXT unrelated idle firing anywhere later in the call
+    hangs up immediately instead of nudging first. Confirmed in a real call
+    log: retry #2 fired 0.8s after the bot finished a normal reply and ended
+    the call outright, because retry #1 had already fired earlier for an
+    unrelated reason.
+    """
+
+    def __init__(self, reset_callback, watch_types):
+        super().__init__()
+        self._reset_callback = reset_callback
+        self._watch_types = tuple(watch_types)
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, self._watch_types):
+            self._reset_callback()
+        await self.push_frame(frame, direction)
+
+
 class LanguageRouterProcessor(FrameProcessor):
     """Sits between `llm` and `tts`. Picks the TTS language from the LLM's OWN
     reply text as it streams out, not from the caller's transcript.
@@ -241,6 +267,12 @@ async def bot(runner_args: RunnerArguments):
 
     idle_retries = 0
 
+    def reset_idle_retries():
+        nonlocal idle_retries
+        if idle_retries:
+            logger.info("IDLE: real activity resumed, resetting retry counter")
+        idle_retries = 0
+
     async def on_idle(processor):
         nonlocal idle_retries
         idle_retries += 1
@@ -272,6 +304,10 @@ async def bot(runner_args: RunnerArguments):
         timeout=IDLE_NUDGE_SECONDS,
         types=[TranscriptionFrame, BotStartedSpeakingFrame, BotStoppedSpeakingFrame],
     )
+    idle_reset = IdleResetProcessor(
+        reset_idle_retries,
+        watch_types=[TranscriptionFrame, BotStartedSpeakingFrame, BotStoppedSpeakingFrame],
+    )
 
     pipeline = Pipeline(
         [
@@ -279,6 +315,7 @@ async def bot(runner_args: RunnerArguments):
             stt,
             lang_hint,
             idle_guard,
+            idle_reset,
             context_aggregator.user(),
             llm,
             lang_router,
