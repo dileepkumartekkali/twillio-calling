@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -13,6 +14,7 @@ from pipecat.frames.frames import (
     LLMRunFrame,
     LLMTextFrame,
     TranscriptionFrame,
+    TTSAudioRawFrame,
     TTSSpeakFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
@@ -183,6 +185,38 @@ own transcript appears to you — never Romanized/Latin transliteration (no
 phone call, not a chat window, so avoid lists, markdown, or long paragraphs."""
 
 
+class AudioGapMonitor(FrameProcessor):
+    """Sits between `tts` and `transport.output()`. Logs a warning whenever
+    the gap between consecutive TTS audio chunks exceeds a threshold that
+    would be audible as a stutter/dropout — pipecat itself doesn't expose
+    any native signal for this (confirmed: no underrun/buffer/resample
+    logging anywhere in the transport or TTS service source), so this is
+    the concrete thing to grep for if choppy voice ever recurs, instead of
+    re-diagnosing from scratch.
+    """
+
+    GAP_WARNING_THRESHOLD_SECS = 0.3
+
+    def __init__(self):
+        super().__init__()
+        self._last_audio_time = None
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TTSAudioRawFrame):
+            now = time.monotonic()
+            if self._last_audio_time is not None:
+                gap = now - self._last_audio_time
+                if gap > self.GAP_WARNING_THRESHOLD_SECS:
+                    logger.warning(f"AUDIO GAP: {gap:.3f}s between TTS audio chunks — likely audible stutter")
+            self._last_audio_time = now
+        elif isinstance(frame, (BotStartedSpeakingFrame, BotStoppedSpeakingFrame)):
+            # Silence BETWEEN utterances is normal, not a gap to flag — only
+            # measure gaps within a single continuous bit of speech.
+            self._last_audio_time = None
+        await self.push_frame(frame, direction)
+
+
 async def bot(runner_args: RunnerArguments):
     transport = await create_transport(
         runner_args,
@@ -283,6 +317,7 @@ async def bot(runner_args: RunnerArguments):
     )
     lang_hint = LanguageHintProcessor()
     lang_router = LanguageRouterProcessor(tts)
+    audio_gap_monitor = AudioGapMonitor()
 
     idle_retries = 0
 
@@ -339,6 +374,7 @@ async def bot(runner_args: RunnerArguments):
             llm,
             lang_router,
             tts,
+            audio_gap_monitor,
             transport.output(),
             context_aggregator.assistant(),
         ]
