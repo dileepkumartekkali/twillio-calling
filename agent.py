@@ -332,6 +332,7 @@ async def bot(runner_args: RunnerArguments):
 
     idle_retries = 0
     call_ending = False
+    user_turn_active = False
 
     def reset_idle_retries():
         nonlocal idle_retries, call_ending
@@ -340,6 +341,30 @@ async def bot(runner_args: RunnerArguments):
         idle_retries = 0
         # Aborts a pending end-call decision too — see the grace period below.
         call_ending = False
+
+    # THE authoritative fix for the hangup-during-stuck-turn race. Root cause,
+    # measured in a real call log: Sarvam STT's transcript delivery has huge
+    # tail latency (14.2s TTFB observed in the same call where other
+    # transcripts took 0.07s), and pipecat's turn-stop machinery waits for
+    # the transcript before letting the LLM fire — so the caller's turn sits
+    # "open" for that entire time with zero frames flowing, the idle timer
+    # reads it as dead air, and no fixed-length grace period can outwait an
+    # unbounded STT delay (the 5s grace expired 6s before the stuck
+    # transcript landed). But pipecat KNOWS the turn is open the whole time —
+    # so instead of guessing with timers, refuse to count idle time or end
+    # the call while a user turn is in progress.
+    user_aggregator = context_aggregator.user()
+
+    @user_aggregator.event_handler("on_user_turn_started")
+    async def on_user_turn_started(aggregator, strategy):
+        nonlocal user_turn_active
+        user_turn_active = True
+        reset_idle_retries()
+
+    @user_aggregator.event_handler("on_user_turn_stopped")
+    async def on_user_turn_stopped(aggregator, strategy, message):
+        nonlocal user_turn_active
+        user_turn_active = False
 
     # Also reset on the LLM's first token (not just caller speech/bot-speaking
     # frames) — confirmed via a real call log this fires ~1s before the bot's
@@ -356,6 +381,11 @@ async def bot(runner_args: RunnerArguments):
         # because the call hadn't actually torn down yet when the next timeout
         # fired. This guard makes the ending decision fire exactly once.
         if call_ending:
+            return
+        if user_turn_active:
+            # The caller HAS spoken — we're waiting on Sarvam STT to deliver
+            # the transcript (up to 14s observed). Not silence; don't count it.
+            logger.info("IDLE FIRED but a user turn is open (STT transcript pending) — not counting")
             return
         idle_retries += 1
         logger.info(f"IDLE FIRED: retry #{idle_retries} (timeout={IDLE_NUDGE_SECONDS}s)")
@@ -383,7 +413,10 @@ async def bot(runner_args: RunnerArguments):
             call_ending = True
             logger.info("IDLE: grace period before ending call (checking for an in-flight response)")
             await asyncio.sleep(IDLE_NUDGE_SECONDS)
-            if call_ending:
+            # user_turn_active re-check: a turn opening mid-grace already clears
+            # call_ending via on_user_turn_started -> reset_idle_retries, but
+            # check it explicitly too so the two guards can't drift apart.
+            if call_ending and not user_turn_active:
                 logger.info("IDLE: ending call")
                 await processor.push_frame(
                     TTSSpeakFrame(GOODBYE_MESSAGES.get(current_lang, GOODBYE_MESSAGES[DEFAULT_LANGUAGE]))
