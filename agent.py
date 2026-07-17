@@ -203,7 +203,21 @@ async def bot(runner_args: RunnerArguments):
         # message plus LLMRunFrame is what reliably produces an opening greeting
         # (pushing the bare system-prompt context frame risks an empty/odd first
         # turn since there's no user message yet for the LLM to respond to).
-        context.add_messages([{"role": "system", "content": "Greet the caller and briefly introduce yourself."}])
+        # Explicitly default to English here: with no caller input yet to mirror,
+        # the LLM was defaulting the greeting to Hindi on its own (likely biased
+        # by "a phone call in India" in SYSTEM_PROMPT), then correctly switching
+        # once real input arrived — so only the greeting itself needed pinning.
+        context.add_messages(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Greet the caller briefly in English — you don't know their "
+                        "language yet. Once they reply, switch to match them as usual."
+                    ),
+                }
+            ]
+        )
         await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
