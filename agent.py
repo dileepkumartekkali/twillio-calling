@@ -238,6 +238,25 @@ async def bot(runner_args: RunnerArguments):
         settings=GroqLLMService.Settings(model="llama-3.3-70b-versatile"),
     )
 
+    async def warm_up_groq():
+        # Confirmed via a real call log: the FIRST request on a fresh Groq
+        # client took 9.8s (TLS/connection-pool setup), a later request in
+        # the same call took 0.1s. A new GroqLLMService is created per call
+        # (no cross-call reuse), so every call pays that cost once unless we
+        # pay it here first — fired as a background task so it runs
+        # concurrently with Sarvam STT/TTS connecting, not blocking either.
+        try:
+            await llm._client.chat.completions.create(
+                model=llm._settings.model,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+            )
+            logger.info("Groq connection warmed up")
+        except Exception:
+            logger.exception("Groq warm-up call failed (non-fatal, continuing)")
+
+    asyncio.create_task(warm_up_groq())
+
     context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}])
     # Without a VAD analyzer, TurnAnalyzerUserTurnStopStrategy never sees a real
     # VADUserStoppedSpeakingFrame and falls back to firing "turn stopped" on a
