@@ -241,6 +241,7 @@ class CallSession:
         self.marks_pending = 0                # Twilio echoes marks when audio has PLAYED
         self.gen_task: asyncio.Task | None = None
         self._mark_counter = 0
+        self._recent_bot_text = ""            # rolling tail of what the bot said (echo guard)
 
         self._stt_ctx = None
         self._stt_socket = None
@@ -277,11 +278,27 @@ class CallSession:
         self.marks_pending = 0
 
     async def speak(self, text: str, language: str):
+        self._recent_bot_text = (self._recent_bot_text + " " + text)[-400:]
         try:
             ulaw = await synthesize_ulaw(text, language)
             await self.send_ulaw(ulaw)
         except Exception:
             logger.exception(f"TTS failed for: {text[:60]!r} ({language})")
+
+    def _looks_like_bot_echo(self, transcript: str) -> bool:
+        """True when a 'caller' transcript is mostly words the bot itself just
+        spoke — i.e. the phone line echoed the bot's voice back into STT (no
+        acoustic echo cancellation exists on this path). Without this guard,
+        the echo transcript trips barge-in and the bot cuts ITSELF off
+        mid-word — heard as broken/unclear speech."""
+        if not self._recent_bot_text:
+            return False
+        recent = set(re.findall(r"\w+", self._recent_bot_text.lower()))
+        words = re.findall(r"\w+", transcript.lower())
+        if not words:
+            return False
+        overlap = sum(w in recent for w in words) / len(words)
+        return overlap >= 0.7
 
     @property
     def bot_speaking(self) -> bool:
@@ -328,6 +345,11 @@ class CallSession:
                 if signal == "START_SPEECH":
                     self.user_speaking = True
                     self.last_activity = time.monotonic()
+                    # The caller's VOICE resets the idle escalation immediately
+                    # (spec: return between 5-10s => silence counter back to 0).
+                    # Waiting for the transcript to reset was too late — STT
+                    # delivery lags seconds behind the voice itself.
+                    self.nudged = False
                     logger.info("VAD(server): user started speaking")
                 elif signal == "END_SPEECH":
                     self.user_speaking = False
@@ -346,6 +368,9 @@ class CallSession:
                 # Barge-in: transcript-gated, >=2 real words while bot output
                 # is in flight (raw VAD blips used to falsely cancel replies).
                 if self.bot_speaking or (self.gen_task and not self.gen_task.done()):
+                    if self._looks_like_bot_echo(transcript):
+                        logger.info(f"Ignoring echo of bot's own speech: {transcript[:50]!r}")
+                        return
                     if len(transcript.split()) >= 2:
                         logger.info("BARGE-IN: interrupting bot output")
                         if self.gen_task and not self.gen_task.done():
@@ -511,6 +536,7 @@ class CallSession:
             if _greeting_ulaw:
                 await self.send_ulaw(_greeting_ulaw)
                 self.messages.append({"role": "assistant", "content": GREETING_TEXT})
+                self._recent_bot_text = GREETING_TEXT  # echo guard covers the greeting too
                 logger.info("Greeting sent from cache")
             else:
                 self._bg_tasks.append(asyncio.create_task(self._greet_on_demand()))
@@ -530,6 +556,11 @@ class CallSession:
                     await self.feed_audio(msg["media"]["payload"])
                 elif event == "mark":
                     self.marks_pending = max(0, self.marks_pending - 1)
+                    # Bot audio just finished PLAYING: the silence clock starts
+                    # now, not at the caller's previous utterance — otherwise a
+                    # long bot reply eats the whole idle window and the nudge/
+                    # hangup fires the moment the bot stops, mid-conversation.
+                    self.last_activity = time.monotonic()
                 elif event == "stop":
                     logger.info("Twilio sent stop — call over")
                     break

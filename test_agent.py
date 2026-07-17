@@ -280,6 +280,72 @@ async def test_handshake_and_media_flow():
     print("PASS Twilio handshake parse + mu-law -> PCM16 relay to STT")
 
 
+async def test_idle_resets_when_user_returns():
+    """Spec: nudge at 5s of continuous silence; if the caller's VOICE returns
+    in the 5-10s window, the counter resets fully to 0 (no hangup at 10s)."""
+    spoken.clear()
+    hangups.clear()
+    ws, s = make_session([])
+    agent._twilio_hangup = fake_hangup
+    await start_session(s)
+    await asyncio.sleep(1.1)  # nudge fires (~0.7s-equiv of 5s, watchdog ticks 0.5s)
+    assert any("Are you there" in t for t, _ in spoken), "nudge should have fired"
+    # Caller's voice returns before the 1.4s-equiv hangup point:
+    await s._on_stt_message(stt_event("START_SPEECH"))
+    await asyncio.sleep(0.15)
+    await s._on_stt_message(stt_event("END_SPEECH"))
+    await asyncio.sleep(0.55)
+    assert not hangups, "voice return between nudge and hangup must reset the counter to 0"
+    assert not s.nudged, "nudge state must reset on the caller's voice, not just transcripts"
+    await stop_session(s)
+    print("PASS idle resets to 0 when caller's voice returns in the 5-10s window")
+
+
+async def test_bot_reply_end_restarts_silence_clock():
+    """A long bot reply must not eat the idle window: the clock starts when
+    the bot FINISHES speaking, not at the caller's previous utterance."""
+    ws, s = make_session([])
+    await start_session(s)
+    s.last_activity = time.monotonic() - 99  # stale: caller spoke 'long ago'
+    s.marks_pending = 1                      # bot reply still playing -> busy
+    await asyncio.sleep(0.6)                 # watchdog ticks; must stay silent
+    assert not s.nudged and not s.call_ending
+    # Bot playback finishes: Twilio echoes the mark (via FakeWS pump)...
+    await ws.incoming.put(json.dumps({"event": "mark", "mark": {"name": "m1"}}))
+    # ...but the pump in this harness doesn't run run()'s handler; emulate it:
+    s.marks_pending = 0
+    s.last_activity = time.monotonic()
+    await asyncio.sleep(0.3)
+    assert not s.nudged, "silence clock must restart at bot-speech end"
+    await stop_session(s)
+    print("PASS silence clock restarts when bot finishes speaking")
+
+
+async def test_echo_guard():
+    """Transcripts that are mostly the bot's own recent words (line echo)
+    must not trigger barge-in — self-interruption sounded like broken audio."""
+    spoken.clear()
+    slow = fake_stream(["I can help with loans today. ", "What would you like to know? "], delay=0.4)
+    ws, s = make_session([slow])
+    await start_session(s)
+    await s._on_stt_message(stt_data("Hello"))
+    await asyncio.sleep(0.5)  # reply streaming, first sentence spoken
+    assert s.gen_task and not s.gen_task.done()
+    # Echo of the bot's own sentence comes back as a "caller" transcript:
+    await s._on_stt_message(stt_data("I can help with loans today"))
+    await asyncio.sleep(0.05)
+    assert not s.gen_task.cancelled(), "echo must not cancel generation"
+    assert not ws.events("clear"), "echo must not clear Twilio audio"
+    assert not s.transcript_buffer, "echo must not become a new turn"
+    # A genuinely different interruption still works:
+    await s._on_stt_message(stt_data("wait tell me something else"))
+    await asyncio.sleep(0.05)
+    assert s.gen_task.cancelled() or s.gen_task.done()
+    assert ws.events("clear")
+    await stop_session(s)
+    print("PASS echo guard: bot's own echoed speech ignored, real barge-in still works")
+
+
 async def main():
     test_wav_to_ulaw()
     await test_handshake_and_media_flow()
@@ -288,6 +354,9 @@ async def main():
     await test_barge_in_and_noise_guard()
     await test_idle_nudge_then_goodbye()
     await test_idle_respects_open_turn()
+    await test_idle_resets_when_user_returns()
+    await test_bot_reply_end_restarts_silence_clock()
+    await test_echo_guard()
     await test_end_call_tool()
     await test_language_flow()
     print("\nall agent self-checks passed")
