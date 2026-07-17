@@ -146,10 +146,11 @@ class LanguageRouterProcessor(FrameProcessor):
     get split across streamed token frames and is unreliable to parse mid-stream.
     """
 
-    def __init__(self, tts: SarvamTTSService):
+    def __init__(self, tts: SarvamTTSService, on_first_token=None):
         super().__init__()
         self._tts = tts
         self._reply_so_far = ""
+        self._on_first_token = on_first_token
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -161,6 +162,12 @@ class LanguageRouterProcessor(FrameProcessor):
                 # "TURN START" log to give LLM time-to-first-token straight from
                 # Render logs, without cross-referencing internal metric lines.
                 logger.info("LLM FIRST TOKEN")
+                # Earliest possible signal that a stuck turn has finally
+                # resolved and a real response is happening — confirmed via a
+                # real call log this fires ~1s before the bot's audio actually
+                # starts, which matters for the idle grace-period race below.
+                if self._on_first_token:
+                    self._on_first_token()
             self._reply_so_far += frame.text
             lang = detect_target_language(self._reply_so_far)
             # ponytail: mutates the TTS service's settings object directly — Sarvam's
@@ -316,7 +323,6 @@ async def bot(runner_args: RunnerArguments):
         ),
     )
     lang_hint = LanguageHintProcessor()
-    lang_router = LanguageRouterProcessor(tts)
     audio_gap_monitor = AudioGapMonitor()
 
     idle_retries = 0
@@ -329,6 +335,12 @@ async def bot(runner_args: RunnerArguments):
         idle_retries = 0
         # Aborts a pending end-call decision too — see the grace period below.
         call_ending = False
+
+    # Also reset on the LLM's first token (not just caller speech/bot-speaking
+    # frames) — confirmed via a real call log this fires ~1s before the bot's
+    # audio actually starts, which is the margin that made the difference
+    # between the grace period below catching a stuck-turn resolution vs missing it.
+    lang_router = LanguageRouterProcessor(tts, on_first_token=reset_idle_retries)
 
     async def on_idle(processor):
         nonlocal idle_retries, call_ending
@@ -354,14 +366,18 @@ async def bot(runner_args: RunnerArguments):
             # Confirmed in a real call log: a caller's earlier utterance can get
             # stuck in pipecat's own turn-completion machinery (repeated speech
             # resets its internal timer) and only resolve well after we've
-            # already decided the call is idle — the real reply started
-            # generating 1.8s after this decision fired, and lost the race
-            # against the EndFrame reaching Twilio's auto-hangup. Give any
-            # in-flight response a grace window to arrive and cancel the
-            # ending (via reset_idle_retries) before we actually commit to it.
+            # already decided the call is idle. First attempt at this fix used
+            # a 2s grace window — verified against the exact log timestamps
+            # afterward and it was NOT long enough: the LLM's first token
+            # landed at +2.4s and TTS audio at +2.5s, both past a 2s cutoff.
+            # Using IDLE_NUDGE_SECONDS gives comfortable margin over the
+            # ~2.5s gap actually observed, and lang_router's on_first_token
+            # hook (added alongside this) resets on the LLM's first token
+            # specifically, ~1s before audio would, rather than waiting for
+            # BotStartedSpeakingFrame as the only signal.
             call_ending = True
             logger.info("IDLE: grace period before ending call (checking for an in-flight response)")
-            await asyncio.sleep(2)
+            await asyncio.sleep(IDLE_NUDGE_SECONDS)
             if call_ending:
                 logger.info("IDLE: ending call")
                 await processor.push_frame(
