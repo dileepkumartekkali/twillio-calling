@@ -80,7 +80,9 @@ async def fake_hangup(call_sid):
 
 def make_session(llm_responses):
     """CallSession wired to fakes. llm_responses: list of fake_stream()s
-    handed out per LLM call."""
+    handed out per LLM call. TTS streaming is disabled so replies exercise
+    the REST fallback path (patched to fake_synthesize); the stream path has
+    its own dedicated test."""
     ws = FakeWS()
     s = CallSession(ws, "MZtest", "CAtest")
     responses = list(llm_responses)
@@ -88,10 +90,31 @@ def make_session(llm_responses):
     async def fake_create(**kwargs):
         return responses.pop(0)
 
+    async def no_stream(language):
+        raise RuntimeError("TTS stream disabled in tests")
+
+    s._get_tts_stream = no_stream
     agent.groq = SimpleNamespace(
         chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create))
     )
     return ws, s
+
+
+class FakeTtsStream:
+    def __init__(self):
+        self.language = "en-IN"
+        self.sent = []
+        self.flushed = False
+        self.closed = False
+
+    async def send_text(self, text):
+        self.sent.append(text)
+
+    async def flush(self):
+        self.flushed = True
+
+    async def close(self):
+        self.closed = True
 
 
 async def _mark_pump(s):
@@ -385,6 +408,37 @@ def test_speech_chunking():
     print("PASS speech chunking: sentences split, long clauses cut early, short text buffered")
 
 
+async def test_streaming_tts_path():
+    """Replies go through the persistent TTS stream: text pieces sent as the
+    LLM produces them, flush at reply end, incoming audio paced out with
+    first-audio timing, barge-in closes the stream to discard synthesis."""
+    ws, s = make_session([fake_stream(["Hello there! ", "Nice day."])])
+    fake_tts = FakeTtsStream()
+
+    async def get_stream(language):
+        fake_tts.language = language
+        s._tts_stream = fake_tts
+        return fake_tts
+
+    s._get_tts_stream = get_stream
+    await start_session(s)
+    await s._on_stt_message(stt_data("Hello"))
+    await asyncio.sleep(0.6)
+    assert fake_tts.sent == ["Hello there! ", "Nice day. "], fake_tts.sent
+    assert fake_tts.flushed, "flush must fire at reply end"
+    # Audio arriving from the stream gets paced out with a mark:
+    s._reply_t0 = time.monotonic()
+    await s.enqueue_stream_audio(b"\x00" * 400)
+    await asyncio.sleep(0.15)  # let the paced sender task emit it
+    assert ws.events("media") and ws.events("mark")
+    assert s._reply_t0 == 0.0, "first-audio timestamp consumed"
+    # Barge-in discards in-flight synthesis by closing the stream:
+    await s._drop_tts_stream()
+    assert fake_tts.closed and s._tts_stream is None
+    await stop_session(s)
+    print("PASS streaming TTS: pieces sent, flushed, audio paced, barge-in closes stream")
+
+
 async def main():
     test_speech_chunking()
     test_wav_to_ulaw()
@@ -398,6 +452,7 @@ async def main():
     await test_bot_reply_end_restarts_silence_clock()
     await test_echo_guard()
     await test_outbound_pacing()
+    await test_streaming_tts_path()
     await test_end_call_tool()
     await test_language_flow()
     print("\nall agent self-checks passed")

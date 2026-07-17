@@ -37,6 +37,7 @@ import wave
 from io import BytesIO
 
 import httpx
+import websockets
 from dotenv import load_dotenv
 from loguru import logger
 from openai import AsyncOpenAI
@@ -230,6 +231,91 @@ async def synthesize_ulaw(text: str, language: str) -> bytes:
     return _wav_or_raw_to_ulaw(audio)
 
 
+TTS_WS_URL = f"wss://api.sarvam.ai/text-to-speech/ws?model={TTS_MODEL}&send_completion_event=true"
+
+
+class TtsStream:
+    """Persistent Sarvam TTS streaming websocket for one call + language.
+
+    Why streaming instead of per-chunk REST: the server buffers text
+    (min_buffer_size=50) and synthesizes with CONTINUOUS PROSODY across the
+    whole reply while emitting audio incrementally — so speech both starts
+    ~0.5s after the first text arrives (vs 1.3-5s REST) and sounds like one
+    natural utterance instead of independently-synthesized clause fragments.
+    Protocol mirrored exactly from the production-proven pipecat integration
+    (config/text/flush/ping in; audio/final/error out).
+    """
+
+    def __init__(self, session: "CallSession", language: str):
+        self.session = session
+        self.language = language
+        self.ws = None
+        self._tasks: list[asyncio.Task] = []
+
+    async def connect(self):
+        self.ws = await websockets.connect(
+            TTS_WS_URL,
+            additional_headers={"api-subscription-key": os.getenv("SARVAM_API_KEY", "").strip()},
+        )
+        await self.ws.send(json.dumps({
+            "type": "config",
+            "data": {
+                "target_language_code": self.language,
+                "speaker": TTS_SPEAKER,
+                "speech_sample_rate": str(SAMPLE_RATE),
+                "enable_preprocessing": True,
+                "min_buffer_size": 50,
+                "max_chunk_length": 150,
+                "output_audio_codec": "linear16",
+                "output_audio_bitrate": "128k",
+                "pace": 1.0,
+                "model": TTS_MODEL,
+            },
+        }))
+        self._tasks.append(asyncio.create_task(self._receiver()))
+        self._tasks.append(asyncio.create_task(self._keepalive()))
+        logger.info(f"TTS stream connected ({self.language})")
+
+    async def _receiver(self):
+        try:
+            async for raw in self.ws:
+                msg = json.loads(raw)
+                mtype = msg.get("type")
+                if mtype == "audio":
+                    pcm = base64.b64decode(msg["data"]["audio"])
+                    await self.session.enqueue_stream_audio(audioop.lin2ulaw(pcm, 2))
+                elif mtype == "event" and msg.get("data", {}).get("event_type") == "final":
+                    logger.debug("TTS stream: synthesis final")
+                elif mtype == "error":
+                    logger.error(f"TTS STREAM ERROR: {msg.get('data', {}).get('message')}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"TTS stream receiver ended: {type(e).__name__}: {e}")
+
+    async def _keepalive(self):
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await self.ws.send(json.dumps({"type": "ping"}))
+            except Exception:
+                return
+
+    async def send_text(self, text: str):
+        await self.ws.send(json.dumps({"type": "text", "data": {"text": text}}))
+
+    async def flush(self):
+        await self.ws.send(json.dumps({"type": "flush"}))
+
+    async def close(self):
+        for t in self._tasks:
+            t.cancel()
+        try:
+            await self.ws.close()
+        except Exception:
+            pass
+
+
 async def warm_up():
     """Run once at server startup (NOT per call): pre-synthesize the greeting
     and open warm connections to Groq and Sarvam so the first call is fast.
@@ -290,6 +376,8 @@ class CallSession:
         self._recent_bot_text = ""            # rolling tail of what the bot said (echo guard)
         self._out_q: asyncio.Queue = asyncio.Queue()  # paced outbound audio/marks
         self._sender_started = False
+        self._tts_stream: TtsStream | None = None
+        self._reply_t0 = 0.0  # for FIRST REPLY AUDIO timing on the stream path
 
         self._stt_ctx = None
         self._stt_socket = None
@@ -319,6 +407,32 @@ class CallSession:
         if not self._sender_started:
             self._sender_started = True
             self._bg_tasks.append(asyncio.create_task(self._output_sender()))
+
+    async def enqueue_stream_audio(self, ulaw: bytes):
+        """Audio arriving from the TTS stream — paced out like everything else."""
+        if self._reply_t0:
+            logger.info(f"FIRST REPLY AUDIO QUEUED (+{time.monotonic() - self._reply_t0:.2f}s from turn fire, stream)")
+            self._reply_t0 = 0.0
+        await self.send_ulaw(ulaw)
+
+    async def _get_tts_stream(self, language: str) -> "TtsStream":
+        """Reuse the stream while the language holds; reconnect on switch."""
+        if self._tts_stream and self._tts_stream.language == language:
+            return self._tts_stream
+        if self._tts_stream:
+            await self._tts_stream.close()
+            self._tts_stream = None
+        stream = TtsStream(self, language)
+        await stream.connect()
+        self._tts_stream = stream
+        return stream
+
+    async def _drop_tts_stream(self):
+        """Barge-in: discard in-flight synthesis by closing the stream (there
+        is no cancel message in the protocol). Next reply reconnects lazily."""
+        if self._tts_stream:
+            await self._tts_stream.close()
+            self._tts_stream = None
 
     async def _output_sender(self):
         """Send queued audio at real-time rate with a small jitter cushion.
@@ -483,6 +597,7 @@ class CallSession:
                         logger.info("BARGE-IN: interrupting bot output")
                         if self.gen_task and not self.gen_task.done():
                             self.gen_task.cancel()
+                        await self._drop_tts_stream()
                         await self.clear_twilio_audio()
                     else:
                         logger.info("Ignoring 1-word blip while bot speaking (noise guard)")
@@ -539,7 +654,7 @@ class CallSession:
                 max_tokens=300,
             )
             first_token = True
-            first_audio = True
+            self._reply_t0 = t0
             async for chunk in stream:
                 if not chunk.choices:
                     continue
@@ -554,16 +669,18 @@ class CallSession:
                         first_token = False
                     reply_so_far += delta.content
                     buffer += delta.content
-                    # Speak each completed sentence/clause while the rest streams.
+                    # Feed each completed sentence/clause to TTS while the rest streams.
                     chunks, buffer = _split_speech_chunks(buffer)
                     for piece in chunks:
                         await self._speak_reply_sentence(piece, reply_so_far)
-                        if first_audio:
-                            logger.info(f"FIRST REPLY AUDIO QUEUED (+{time.monotonic() - t0:.2f}s from turn fire)")
-                            first_audio = False
             if buffer.strip():
                 await self._speak_reply_sentence(buffer.strip(), reply_so_far)
                 buffer = ""
+            if self._tts_stream:
+                try:
+                    await self._tts_stream.flush()  # synthesize any server-buffered tail
+                except Exception:
+                    logger.exception("TTS stream flush failed")
             if reply_so_far.strip():
                 self.messages.append({"role": "assistant", "content": reply_so_far.strip()})
             if end_call_requested:
@@ -584,7 +701,19 @@ class CallSession:
         # actually spoken (detecting on caller input drifts when the LLM does).
         lang = detect_target_language(reply_so_far)
         self.current_lang = lang
-        await self.speak(sentence, lang)
+        self._recent_bot_text = (self._recent_bot_text + " " + sentence)[-400:]
+        try:
+            tts = await self._get_tts_stream(lang)
+            await tts.send_text(sentence + " ")
+        except Exception:
+            # Streaming path down: degrade to per-piece REST synthesis (the
+            # previous behavior) rather than going silent.
+            logger.exception("TTS stream failed; falling back to REST for this piece")
+            self._tts_stream = None
+            await self.speak(sentence, lang)
+            if self._reply_t0:
+                logger.info(f"FIRST REPLY AUDIO QUEUED (+{time.monotonic() - self._reply_t0:.2f}s from turn fire, rest)")
+                self._reply_t0 = 0.0
 
     # ---------------- Idle watchdog ----------------
 
@@ -713,6 +842,9 @@ class CallSession:
             t.cancel()
         if self.gen_task and not self.gen_task.done():
             self.gen_task.cancel()
+        if self._tts_stream:
+            await self._tts_stream.close()
+            self._tts_stream = None
         if self._stt_ctx and self._stt_socket:
             try:
                 await self._stt_ctx.__aexit__(None, None, None)
