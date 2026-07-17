@@ -5,12 +5,14 @@ import time
 from dotenv import load_dotenv
 from loguru import logger
 
+from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     EndFrame,
+    FunctionCallResultProperties,
     LLMRunFrame,
     LLMTextFrame,
     TranscriptionFrame,
@@ -206,7 +208,12 @@ pure Hindi unless they did. Write Indian-language words in their NATIVE SCRIPT
 (Devanagari for Hindi, Telugu script for Telugu, etc.) exactly as the caller's
 own transcript appears to you — never Romanized/Latin transliteration (no
 "kaise ho", write "कैसे हो"). Keep replies short and conversational: this is a
-phone call, not a chat window, so avoid lists, markdown, or long paragraphs."""
+phone call, not a chat window, so avoid lists, markdown, or long paragraphs.
+
+If the caller asks to end the call — in ANY language or mix ("end the call",
+"call cut chey", "कॉल काट दो", "band karo", "hang up", "bye, cut it", etc.) —
+call the end_call function immediately. Do not reply with text instead of
+calling it; the goodbye is spoken automatically."""
 
 
 class AudioGapMonitor(FrameProcessor):
@@ -315,7 +322,41 @@ async def bot(runner_args: RunnerArguments):
 
     asyncio.create_task(warm_up_groq())
 
-    context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}])
+    async def end_call(params):
+        # LLM-driven hangup: the LLM calls this tool when the caller asks to
+        # end the call in ANY language/mix ("call cut chey", "कॉल काट दो",
+        # "hang up"...) — the LLM does the language understanding, so no
+        # brittle per-language keyword list. run_llm=False stops a second
+        # LLM reply from generating; the localized goodbye is spoken here.
+        # call_ending / task / tts are bot() locals defined below this
+        # handler — resolved at call time, long after bot() finishes setup.
+        nonlocal call_ending
+        call_ending = True
+        logger.info("END CALL: caller asked to end the call (LLM tool call)")
+        await params.result_callback(
+            {"status": "ending call"},
+            properties=FunctionCallResultProperties(run_llm=False),
+        )
+        current_lang = tts._settings.language
+        await task.queue_frames(
+            [
+                TTSSpeakFrame(GOODBYE_MESSAGES.get(current_lang, GOODBYE_MESSAGES[DEFAULT_LANGUAGE])),
+                EndFrame(),
+            ]
+        )
+
+    end_call_tool = FunctionSchema(
+        name="end_call",
+        description=(
+            "End the phone call. Call this immediately when the caller asks to "
+            "end, cut, stop, or hang up the call, in any language or language mix."
+        ),
+        properties={},
+        required=[],
+        handler=end_call,
+    )
+
+    context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}], tools=[end_call_tool])
     # Without a VAD analyzer, TurnAnalyzerUserTurnStopStrategy never sees a real
     # VADUserStoppedSpeakingFrame and falls back to firing "turn stopped" on a
     # blind ~1s timeout after EVERY transcript — so one utterance can trigger
