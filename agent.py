@@ -245,6 +245,10 @@ class CallSession:
         self._stt_ctx = None
         self._stt_socket = None
         self._bg_tasks: list[asyncio.Task] = []
+        # Strong refs for fire-and-forget tasks: asyncio only weakly references
+        # running tasks, so an unreferenced create_task() can be garbage
+        # collected mid-flight and silently drop STT messages.
+        self._msg_tasks: set[asyncio.Task] = set()
 
     # ---------------- Twilio output ----------------
 
@@ -313,7 +317,9 @@ class CallSession:
 
     def _on_stt_message_sync(self, message):
         # SDK callbacks are sync; hop back into async land.
-        asyncio.create_task(self._on_stt_message(message))
+        t = asyncio.create_task(self._on_stt_message(message))
+        self._msg_tasks.add(t)
+        t.add_done_callback(self._msg_tasks.discard)
 
     async def _on_stt_message(self, message):
         try:
@@ -507,7 +513,7 @@ class CallSession:
                 self.messages.append({"role": "assistant", "content": GREETING_TEXT})
                 logger.info("Greeting sent from cache")
             else:
-                asyncio.create_task(self._greet_on_demand())
+                self._bg_tasks.append(asyncio.create_task(self._greet_on_demand()))
 
             await self.connect_stt()
             self.last_activity = time.monotonic()
@@ -560,15 +566,20 @@ async def handle_twilio_ws(websocket):
     """Entry point from server.py: parse Twilio's handshake, run the session."""
     global active_calls
     stream_sid = call_sid = None
-    # Twilio sends "connected" then "start"; media only after that.
-    while True:
-        msg = json.loads(await websocket.receive_text())
-        if msg.get("event") == "start":
-            stream_sid = msg["start"]["streamSid"]
-            call_sid = msg["start"]["callSid"]
-            break
-        if msg.get("event") == "stop":
-            return
+    # Twilio sends "connected" then "start"; media only after that. A caller
+    # abandoning during this handshake just ends the coroutine quietly.
+    try:
+        while True:
+            msg = json.loads(await websocket.receive_text())
+            if msg.get("event") == "start":
+                stream_sid = msg["start"]["streamSid"]
+                call_sid = msg["start"]["callSid"]
+                break
+            if msg.get("event") == "stop":
+                return
+    except Exception as e:
+        logger.info(f"Caller left during handshake: {type(e).__name__}")
+        return
 
     if active_calls >= MAX_CONCURRENT_CALLS:
         logger.warning("Call rejected: concurrency cap reached")
