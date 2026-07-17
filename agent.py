@@ -95,7 +95,12 @@ class LanguageHintProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and frame.text:
             lang = detect_target_language(frame.text)
-            frame.text = f"[Caller's language: {lang}] {frame.text}"
+            # Compact single-token tag, not a multi-word bracket phrase — a
+            # verbose tag like "[Caller's language: en-IN]" adds ~4 words by
+            # whitespace-count, which inflates MinWordsUserTurnStartStrategy's
+            # word count and would silently defeat its noise-filtering the
+            # moment a real barge-in scenario relies on min_words=2.
+            frame.text = f"[{lang}] {frame.text}"
             # High-signal marker for reading latency out of Render logs: every
             # real caller turn logs here, so "time from this line to the next
             # Bot started speaking line" is the actual end-to-end turn latency,
