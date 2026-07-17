@@ -13,7 +13,6 @@ from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     EndFrame,
     FunctionCallResultProperties,
-    LLMRunFrame,
     LLMTextFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
@@ -557,26 +556,15 @@ async def bot(runner_args: RunnerArguments):
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        # Verified against Sarvam's own Twilio+Pipecat reference: a one-off system
-        # message plus LLMRunFrame is what reliably produces an opening greeting
-        # (pushing the bare system-prompt context frame risks an empty/odd first
-        # turn since there's no user message yet for the LLM to respond to).
-        # Explicitly default to English here: with no caller input yet to mirror,
-        # the LLM was defaulting the greeting to Hindi on its own (likely biased
-        # by "a phone call in India" in SYSTEM_PROMPT), then correctly switching
-        # once real input arrived — so only the greeting itself needed pinning.
-        context.add_messages(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "Greet the caller briefly in English — you don't know their "
-                        "language yet. Once they reply, switch to match them as usual."
-                    ),
-                }
-            ]
-        )
-        await task.queue_frames([LLMRunFrame()])
+        # Fixed-text greeting via TTSSpeakFrame, not an LLM round-trip: the
+        # greeting text never varies ("greet in English" is a requirement),
+        # so composing it live with Groq cost 1.5-2.5s of LLM+aggregation
+        # latency per call at the moment callers are most impatient — and
+        # earlier it also let the LLM pick Hindi on its own. Deterministic
+        # text kills both. TTSSpeakFrame output lands in the LLM context as
+        # an assistant message (confirmed in real call logs — the idle
+        # nudges show up there), so the LLM knows it already greeted.
+        await task.queue_frames([TTSSpeakFrame("Hello! How can I help you today?")])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
