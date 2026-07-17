@@ -158,13 +158,20 @@ def _wav_or_raw_to_ulaw(audio_bytes: bytes) -> bytes:
         with wave.open(BytesIO(audio_bytes), "rb") as w:
             rate, width, channels = w.getframerate(), w.getsampwidth(), w.getnchannels()
             pcm = w.readframes(w.getnframes())
+        logger.debug(f"TTS WAV: {rate}Hz, {width * 8}-bit, {channels}ch, {len(pcm)} bytes")
         if channels == 2:
             pcm = audioop.tomono(pcm, width, 0.5, 0.5)
         if width != 2:
             pcm = audioop.lin2lin(pcm, width, 2)
         if rate != SAMPLE_RATE:
+            # audioop.ratecv has NO anti-aliasing filter — downsampling here
+            # produces harsh/metallic voice. We request 8kHz so this should
+            # never run; if this warning appears in logs, THAT is the voice
+            # clarity culprit and the fix is making Sarvam honor 8kHz output.
+            logger.warning(f"TTS CLARITY RISK: Sarvam returned {rate}Hz, resampling to {SAMPLE_RATE}Hz without filtering")
             pcm, _ = audioop.ratecv(pcm, 2, 1, rate, SAMPLE_RATE, None)
     else:
+        logger.debug(f"TTS raw (no RIFF header): {len(audio_bytes)} bytes, assuming PCM16 @ 8kHz")
         pcm = audio_bytes  # trust requested format: PCM16 @ 8kHz mono
     return audioop.lin2ulaw(pcm, 2)
 
