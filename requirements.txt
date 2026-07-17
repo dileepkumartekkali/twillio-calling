@@ -1,5 +1,10 @@
 pipecat-ai[websocket,sarvam]
 sarvamai>=0.1.25
+# GoogleLLMService needs these two directly — not pulling in the full
+# pipecat-ai[google] extra, which also drags in google-cloud-speech/
+# google-cloud-texttospeech that we don't use (Sarvam handles STT/TTS).
+google-genai>=1.68.0,<3
+google-api-core
 python-dotenv
 loguru
 fastapi

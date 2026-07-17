@@ -19,7 +19,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.idle_frame_processor import IdleFrameProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.sarvam.llm import SarvamLLMService
+from pipecat.services.google.llm import GoogleLLMService
 from pipecat.services.sarvam.stt import SarvamSTTService
 from pipecat.services.sarvam.tts import SarvamTTSService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
@@ -122,20 +122,20 @@ async def bot(runner_args: RunnerArguments):
             pace=1.0,
         ),
     )
-    # Reverted from GroqLLMService: no evidence Llama models reliably write
-    # native Indic script (Devanagari/Telugu/etc.) the way SYSTEM_PROMPT
-    # requires — general models tend to transliterate to Latin script, which
-    # silently breaks LanguageRouterProcessor's script-based TTS-language
-    # detection and made every reply come out in English regardless of what
-    # the caller spoke. Sarvam's own LLM is trained for this specifically.
-    # The ~18s latency that motivated the Groq swap was measured *before* the
-    # VAD fix below — duplicate stacked LLM calls per turn (see chat notes on
-    # the mid-call latency debug) were likely inflating that number by
-    # contending on the same API key; re-measure latency now that only one
-    # clean call fires per turn before reaching for a faster LLM again.
-    llm = SarvamLLMService(
-        api_key=os.getenv("SARVAM_API_KEY"),
-        settings=SarvamLLMService.Settings(model="sarvam-30b"),
+    # Confirmed post-VAD-fix: Sarvam's own LLM is still too slow for a live call
+    # (user-verified, not just the earlier stacked-call artifact). Groq/Llama
+    # was fast but had no evidence of reliable native-script Indic output.
+    # Gemini 2.5 Flash-Lite is the balance: fastest measured time-to-first-token
+    # of any option checked (artificialanalysis.ai), and Google has published
+    # both a dedicated Indic-generation benchmark (IndicGenBench) and product
+    # claims of native-script output across 9 Indian languages — the strongest
+    # evidence available for any non-Sarvam model. Still verify Telugu/Tamil
+    # script fidelity on real calls before fully trusting it; per published
+    # script-comprehension studies those two degrade more than Hindi across
+    # every model tested, Gemini included.
+    llm = GoogleLLMService(
+        api_key=os.getenv("GOOGLE_API_KEY"),
+        settings=GoogleLLMService.Settings(model="gemini-2.5-flash-lite"),
     )
 
     context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}])
