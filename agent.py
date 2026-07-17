@@ -169,6 +169,12 @@ async def bot(runner_args: RunnerArguments):
     )
     tts = SarvamTTSService(
         api_key=os.getenv("SARVAM_API_KEY"),
+        # bulbul:v3 defaults to generating at 24kHz, which then has to be
+        # downsampled to Twilio's required 8kHz on every streamed chunk —
+        # an extra resampling stage on small, frequent chunks is a known
+        # source of choppy/robotic-sounding audio. Generating natively at
+        # 8000 (a Sarvam-documented supported rate) skips that step entirely.
+        sample_rate=8000,
         settings=SarvamTTSService.Settings(
             model="bulbul:v3",
             # "shubh" is Sarvam's own documented default speaker for bulbul:v3 —
