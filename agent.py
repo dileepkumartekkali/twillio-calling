@@ -186,6 +186,7 @@ async def bot(runner_args: RunnerArguments):
         params=PipelineParams(
             audio_in_sample_rate=8000,
             audio_out_sample_rate=8000,
+            enable_metrics=True,  # per-turn TTFB/processing time in logs, for real latency numbers
         ),
     )
 
