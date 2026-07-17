@@ -37,6 +37,9 @@ from pipecat.services.sarvam.stt import SarvamSTTService
 from pipecat.services.sarvam.tts import SarvamTTSService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from pipecat.turns.user_start.min_words_user_turn_start_strategy import MinWordsUserTurnStartStrategy
+from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import (
+    SpeechTimeoutUserTurnStopStrategy,
+)
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 from lang_router import DEFAULT_LANGUAGE, detect_target_language
@@ -389,7 +392,25 @@ async def bot(runner_args: RunnerArguments):
             # actually-transcribed words to interrupt the bot while it's speaking
             # (only 1 word when it isn't, so normal turns still start immediately) —
             # filters out noise/echo blips without slowing down real conversation.
-            user_turn_strategies=UserTurnStrategies(start=[MinWordsUserTurnStartStrategy(min_words=2)]),
+            # Stop strategy: SpeechTimeoutUserTurnStopStrategy (VAD + timers)
+            # instead of the default TurnAnalyzerUserTurnStopStrategy, which
+            # loads and runs the Smart Turn ONNX model. On Render's 0.1-CPU
+            # free tier the model load per call burns the cgroup CPU quota and
+            # the resulting throttle debt is what the consistent ~7s
+            # "added worker -> starting worker" stall in every call log
+            # actually is — the bot is deaf that entire time (words spoken
+            # before Sarvam STT connects are lost, which is why callers had
+            # to repeat "hello"). Its per-turn inference also competes with
+            # live audio streaming for the same CPU slice (the AUDIO GAP
+            # stutters). VAD is confirmed firing since the min_volume fix, so
+            # the VAD-timer strategy is reliable now, and it keeps the same
+            # STT-latency safety net and transcript fallback. Tradeoff given
+            # up: semantic end-of-turn detection (knowing a trailing "I want
+            # to..." isn't finished) — silence-based stop only.
+            user_turn_strategies=UserTurnStrategies(
+                start=[MinWordsUserTurnStartStrategy(min_words=2)],
+                stop=[SpeechTimeoutUserTurnStopStrategy()],
+            ),
         ),
     )
     lang_hint = LanguageHintProcessor()
