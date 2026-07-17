@@ -239,6 +239,7 @@ class CallSession:
         # Turn state (timestamps instead of frame plumbing)
         self.transcript_buffer: list[str] = []
         self.last_transcript_time = 0.0
+        self._last_end_speech = 0.0
         self.user_speaking = False            # Sarvam server VAD START/END_SPEECH
         self.last_activity = time.monotonic() # caller-side activity only
         self.nudged = False
@@ -324,7 +325,12 @@ class CallSession:
     async def speak(self, text: str, language: str):
         self._recent_bot_text = (self._recent_bot_text + " " + text)[-400:]
         try:
+            t0 = time.monotonic()
             ulaw = await synthesize_ulaw(text, language)
+            logger.info(
+                f"TTS synth {time.monotonic() - t0:.2f}s: {len(text)} chars ({language}) "
+                f"-> {len(ulaw) / SAMPLE_RATE:.1f}s audio"
+            )
             await self.send_ulaw(ulaw)
         except Exception:
             logger.exception(f"TTS failed for: {text[:60]!r} ({language})")
@@ -401,6 +407,7 @@ class CallSession:
                 elif signal == "END_SPEECH":
                     self.user_speaking = False
                     self.last_activity = time.monotonic()
+                    self._last_end_speech = time.monotonic()
                     logger.info("VAD(server): user stopped speaking")
             elif message.type == "data":
                 transcript = (message.data.transcript or "").strip()
@@ -408,7 +415,10 @@ class CallSession:
                     return  # empty/silence transcript: never trigger a turn (old known gap)
                 lang = detect_target_language(transcript)
                 tagged = f"[{lang}] {transcript}"
-                logger.info(f"TURN START: {tagged}")
+                # STT delivery lag: END_SPEECH -> transcript arrival. The old
+                # build's chronic latency lived exactly in this gap (14s spikes).
+                lag = time.monotonic() - self._last_end_speech if self._last_end_speech else -1
+                logger.info(f"TURN START: {tagged} (transcript +{lag:.2f}s after END_SPEECH)")
                 self.last_activity = time.monotonic()
                 self.nudged = False
 
@@ -460,6 +470,7 @@ class CallSession:
                 continue
             user_text = " ".join(self.transcript_buffer)
             self.transcript_buffer.clear()
+            logger.info(f"TURN FIRED: {user_text[:80]!r}")
             self.gen_task = asyncio.create_task(self._run_llm_turn(user_text))
 
     async def _run_llm_turn(self, user_text: str):
@@ -477,6 +488,7 @@ class CallSession:
                 max_tokens=300,
             )
             first_token = True
+            first_audio = True
             async for chunk in stream:
                 if not chunk.choices:
                     continue
@@ -497,6 +509,9 @@ class CallSession:
                     for sentence in parts[:-1]:
                         if sentence.strip():
                             await self._speak_reply_sentence(sentence.strip(), reply_so_far)
+                            if first_audio:
+                                logger.info(f"FIRST REPLY AUDIO QUEUED (+{time.monotonic() - t0:.2f}s from turn fire)")
+                                first_audio = False
             if buffer.strip():
                 await self._speak_reply_sentence(buffer.strip(), reply_so_far)
                 buffer = ""
