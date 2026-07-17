@@ -16,6 +16,8 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -132,6 +134,16 @@ class IdleResetProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, self._watch_types):
             self._reset_callback()
+        # Diagnostic breadcrumbs: these VAD frames are broadcast upstream by
+        # the context aggregator and pass through here on their way to Sarvam
+        # STT, whose end-of-speech flush() fires ONLY on the stopped frame.
+        # If these lines never appear in a call's log, Silero VAD isn't firing
+        # (volume/confidence gate) and Sarvam is left to guess utterance ends
+        # server-side — the confirmed cause of 14s transcript-delivery spikes.
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            logger.info("VAD: user started speaking")
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+            logger.info("VAD: user stopped speaking (STT flush should follow)")
         await self.push_frame(frame, direction)
 
 
@@ -314,7 +326,20 @@ async def bot(runner_args: RunnerArguments):
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+            # min_volume lowered from the 0.6 default: pipecat's VAD gate is
+            # "confidence >= 0.7 AND volume >= min_volume", where volume is
+            # EBU-R128 loudness normalized to [0,1] — compressed 8kHz mu-law
+            # phone audio frequently sits below 0.6, so at the default the VAD
+            # never fires on quiet callers. When VAD doesn't fire, Sarvam STT's
+            # end-of-speech flush() never runs (it's gated on
+            # VADUserStoppedSpeakingFrame) and Sarvam's server segments
+            # utterances on its own timetable — measured at up to 14.2s in a
+            # real call. Silero's neural confidence (0.7, unchanged) remains
+            # the actual voice detector; the volume floor is just a noise
+            # pre-filter, and 0.4 keeps some floor without gating out phone
+            # speech. ponytail: if VAD still never logs on real calls, drop
+            # this further or to 0 and rely on confidence alone.
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2, min_volume=0.4)),
             # Default start strategy (VADUserTurnStartStrategy) triggers a barge-in
             # on ANY audio energy, including noise or the bot's own voice leaking
             # back on the line (no echo cancellation on this call) — confirmed in
@@ -432,14 +457,25 @@ async def bot(runner_args: RunnerArguments):
     # that gap), misreading normal turn latency as caller silence and cutting
     # the call mid-conversation. Now it resets on either side's activity, so it
     # only fires on genuine dead air from both parties.
+    # VADUserStarted/StoppedSpeakingFrame included too (broadcast upstream by
+    # the aggregator, so they pass through this position): raw speech detection
+    # counts as activity the moment the caller's voice starts, without waiting
+    # for the transcript — which Sarvam can take seconds to deliver.
+    _activity_frames = [
+        TranscriptionFrame,
+        BotStartedSpeakingFrame,
+        BotStoppedSpeakingFrame,
+        VADUserStartedSpeakingFrame,
+        VADUserStoppedSpeakingFrame,
+    ]
     idle_guard = IdleFrameProcessor(
         callback=on_idle,
         timeout=IDLE_NUDGE_SECONDS,
-        types=[TranscriptionFrame, BotStartedSpeakingFrame, BotStoppedSpeakingFrame],
+        types=_activity_frames,
     )
     idle_reset = IdleResetProcessor(
         reset_idle_retries,
-        watch_types=[TranscriptionFrame, BotStartedSpeakingFrame, BotStoppedSpeakingFrame],
+        watch_types=_activity_frames,
     )
 
     pipeline = Pipeline(
