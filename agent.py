@@ -74,6 +74,27 @@ GOODBYE_MESSAGES = {
 }
 
 
+class LanguageHintProcessor(FrameProcessor):
+    """Sits between `stt` and the context aggregator. Tags each caller
+    transcript with its script-detected language before it reaches the LLM,
+    instead of leaving language purely to the LLM's own inference from raw
+    text. Reuses the same detect_target_language() already used for TTS
+    voice selection — no extra API call, just another pass over text that's
+    already flowing through here.
+
+    Tagging the transcript itself (not a separate system message) keeps the
+    hint attached to the exact turn it's about, so it can't go stale or get
+    lost among earlier system messages on a long call.
+    """
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame) and frame.text:
+            lang = detect_target_language(frame.text)
+            frame.text = f"[Caller's language: {lang}] {frame.text}"
+        await self.push_frame(frame, direction)
+
+
 class LanguageRouterProcessor(FrameProcessor):
     """Sits between `llm` and `tts`. Picks the TTS language from the LLM's OWN
     reply text as it streams out, not from the caller's transcript.
@@ -185,6 +206,7 @@ async def bot(runner_args: RunnerArguments):
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2))),
     )
+    lang_hint = LanguageHintProcessor()
     lang_router = LanguageRouterProcessor(tts)
 
     idle_retries = 0
@@ -223,6 +245,7 @@ async def bot(runner_args: RunnerArguments):
         [
             transport.input(),
             stt,
+            lang_hint,
             idle_guard,
             context_aggregator.user(),
             llm,
