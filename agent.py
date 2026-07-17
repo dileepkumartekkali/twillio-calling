@@ -31,6 +31,8 @@ from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.sarvam.stt import SarvamSTTService
 from pipecat.services.sarvam.tts import SarvamTTSService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
+from pipecat.turns.user_start.min_words_user_turn_start_strategy import MinWordsUserTurnStartStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 from lang_router import DEFAULT_LANGUAGE, detect_target_language
 
@@ -210,7 +212,19 @@ async def bot(runner_args: RunnerArguments):
     # VAD-gated flush() fire at the right time too).
     context_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2))),
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+            # Default start strategy (VADUserTurnStartStrategy) triggers a barge-in
+            # on ANY audio energy, including noise or the bot's own voice leaking
+            # back on the line (no echo cancellation on this call) — confirmed in
+            # a real call log: false triggers repeatedly cancelled the greeting
+            # mid-sentence and restarted the turn cycle, producing "how can I help
+            # you" 2-3 times in a row. MinWordsUserTurnStartStrategy requires 2+
+            # actually-transcribed words to interrupt the bot while it's speaking
+            # (only 1 word when it isn't, so normal turns still start immediately) —
+            # filters out noise/echo blips without slowing down real conversation.
+            user_turn_strategies=UserTurnStrategies(start=[MinWordsUserTurnStartStrategy(min_words=2)]),
+        ),
     )
     lang_hint = LanguageHintProcessor()
     lang_router = LanguageRouterProcessor(tts)
